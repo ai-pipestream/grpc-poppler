@@ -1,0 +1,43 @@
+name: C++ build and contract tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image and run the test suite
+        # The build stage runs the full ctest suite, so a green build proves
+        # the tests pass; building the full image (not just the build stage)
+        # also assembles the runtime stage, so a runtime library missing
+        # from the staged closure fails here instead of at deploy time.
+        run: docker build --progress=plain -t grpc-poppler:ci .
+      - name: Boot-proof the runtime image
+        # The service must bind its port and stay up; the health check
+        # service answers on it.
+        run: |
+          container_id="$(docker run -d -p 50071:50071 grpc-poppler:ci)"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 30); do
+            if (exec 3<>"/dev/tcp/127.0.0.1/50071") 2>/dev/null; then
+              exec 3>&- 3<&-
+              echo "grpc-poppler is accepting connections on 50071"
+              exit 0
+            fi
+            if ! docker inspect -f '{{.State.Running}}' "$container_id" | grep -q true; then
+              echo "container exited before accepting connections"
+              docker logs "$container_id"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "timed out waiting for port 50071"
+          docker logs "$container_id"
+          exit 1
