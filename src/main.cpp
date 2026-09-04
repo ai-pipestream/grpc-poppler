@@ -19,7 +19,7 @@ constexpr int kMaxMessageBytes = 520 * 1024 * 1024;
 int main() {
   const char* port_env = std::getenv("GRPC_POPPLER_PORT");
   const std::string address =
-      std::string("0.0.0.0:") + (port_env != nullptr ? port_env : "50053");
+      std::string("0.0.0.0:") + (port_env != nullptr ? port_env : "50071");
 
   grpc::EnableDefaultHealthCheckService(true);
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();

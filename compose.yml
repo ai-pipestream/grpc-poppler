@@ -6,6 +6,6 @@ services:
     image: grpc-poppler:latest
     profiles: ["differential"]
     ports:
-      - "50053:50053"
+      - "50071:50071"
     environment:
-      GRPC_POPPLER_PORT: "50053"
+      GRPC_POPPLER_PORT: "50071"
