@@ -162,10 +162,16 @@ void LoadDocument(const std::string& data, const pdfv1::PdfDocument& request,
   out->status = pdfv1::LOAD_STATUS_OK;
 }
 
+// The one engine identity string, shared by Probe capabilities and
+// GetServiceInfo so an orchestrator sees the same value either way.
+std::string EngineVersion() {
+  return std::string("poppler ") + poppler::version_string();
+}
+
 void FillCapabilities(const LoadedDocument& loaded,
                       pdfv1::BackendCapabilities* caps) {
   caps->set_backend_name(kBackendName);
-  caps->set_engine_version(std::string("poppler ") + poppler::version_string());
+  caps->set_engine_version(EngineVersion());
   caps->set_load_status(loaded.status);
   if (loaded.status != pdfv1::LOAD_STATUS_OK) {
     if (!loaded.detail.empty()) caps->set_load_detail(loaded.detail);
@@ -579,6 +585,22 @@ grpc::Status PopplerServiceImpl::Render(
                            image.height());
     if (!writer->Write(msg)) return grpc::Status::OK;
   }
+  return grpc::Status::OK;
+}
+
+grpc::Status PopplerServiceImpl::GetServiceInfo(
+    grpc::ServerContext* /*context*/,
+    const pdfv1::ServiceInfoRequest* /*request*/,
+    pdfv1::ServiceInfoResponse* response) {
+  response->set_backend_name(kBackendName);
+  response->set_engine_version(EngineVersion());
+  response->set_build_version(GRPC_POPPLER_BUILD_VERSION);
+  auto* ui = response->mutable_ui();
+  ui->set_title("Poppler");
+  ui->set_path("/ui/poppler");
+  ui->set_description(
+      "Poppler PDF backend, the fleet's GPL extraction-quality reference; "
+      "no web UI yet");
   return grpc::Status::OK;
 }
 

@@ -10,6 +10,28 @@ include(FetchContent)
 add_library(grpc_poppler_flags INTERFACE)
 target_compile_options(grpc_poppler_flags INTERFACE -Wall -Wextra)
 
+# Build version reported by GetServiceInfo: the image tag when built in
+# Docker (passed as -DGRPC_POPPLER_BUILD_VERSION), else git describe, else
+# "dev".
+set(GRPC_POPPLER_BUILD_VERSION "" CACHE STRING
+    "build version GetServiceInfo reports")
+if(NOT GRPC_POPPLER_BUILD_VERSION)
+  find_package(Git QUIET)
+  if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      OUTPUT_VARIABLE GRPC_POPPLER_BUILD_VERSION
+      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  endif()
+  if(NOT GRPC_POPPLER_BUILD_VERSION)
+    set(GRPC_POPPLER_BUILD_VERSION "dev")
+  endif()
+endif()
+message(STATUS "grpc-poppler build version: ${GRPC_POPPLER_BUILD_VERSION}")
+target_compile_definitions(grpc_poppler_flags
+    INTERFACE GRPC_POPPLER_BUILD_VERSION="${GRPC_POPPLER_BUILD_VERSION}")
+
 # ---------------------------------------------------------------------------
 # gRPC + protobuf, the fleet's C++ pattern (same tag as gRParse).
 # ---------------------------------------------------------------------------
@@ -30,7 +52,7 @@ FetchContent_MakeAvailable(grpc)
 # fetched from the parser-protos repo at a pinned commit; gRParse backends/
 # holds the same bytes.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_COMMIT "4d72ec2c4550f8110ba03550f659c931d57e024d"
+set(PDF_PROTOS_COMMIT "f1ddf559b40a21a57e87d21810c70fa20512ed1b"
     CACHE STRING "parser-protos commit the contract comes from")
 set(PDF_PROTOS_BASE_URL
     "https://git.rokkon.com/ai-pipestream/parser-protos/raw/commit/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
@@ -39,7 +61,7 @@ set(PDF_PROTO_TYPES_SHA256
     "5570baad185a6f008976c8f013a48382b04c83b54a60ccdf94b0cd0a65bf2cce"
     CACHE STRING "sha256 of pdf_backend_types.proto")
 set(PDF_PROTO_SERVICE_SHA256
-    "ae8ae5bb765e771b98176501ffc59583bf0c0428b7aa45e37e011f1e02aeeecd"
+    "f0d47132b48af9cf09007afac32b26ef8f8e521b16f7bc105780d6afef5e4e8a"
     CACHE STRING "sha256 of pdf_backend_service.proto")
 set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "directory holding the contract protos, instead of the pinned download")
 

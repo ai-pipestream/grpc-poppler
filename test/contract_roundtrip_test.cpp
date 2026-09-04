@@ -73,6 +73,19 @@ int main(int argc, char** argv) {
   }
   {
     grpc::ClientContext ctx;
+    pdfv1::ServiceInfoRequest request;
+    pdfv1::ServiceInfoResponse response;
+    Check(stub->GetServiceInfo(&ctx, request, &response).ok(),
+          "GetServiceInfo RPC OK");
+    Check(response.backend_name() == "grpc-poppler",
+          "GetServiceInfo backend name matches Probe");
+    Check(!response.engine_version().empty(), "engine version reported");
+    Check(!response.build_version().empty(), "build version reported");
+    Check(response.has_ui() && response.ui().path() == "/ui/poppler",
+          "UiInfo advertisement present");
+  }
+  {
+    grpc::ClientContext ctx;
     pdfv1::ProbeRequest request;
     request.mutable_document()->set_data("not a pdf");
     pdfv1::ProbeResponse response;
