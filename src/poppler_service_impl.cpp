@@ -17,6 +17,9 @@
 #include <poppler/cpp/poppler-toc.h>
 #include <poppler/cpp/poppler-version.h>
 
+#include "document_cache.h"
+#include "sha256.h"
+
 namespace grpc_poppler {
 
 namespace pdfv1 = ai::protomolt::parse::pdf::v1;
@@ -85,8 +88,49 @@ struct LoadedDocument {
   std::string detail;
 };
 
-void LoadDocument(const pdfv1::PdfDocument& request, LoadedDocument* out) {
-  const std::string& data = request.data();
+// The content-addressed handshake (PdfDocument.sha256), resolved once for
+// all three RPCs. bytes is set when status is LOAD_STATUS_OK and points at
+// either the request or a cache entry (cached keeps the entry alive).
+struct ResolvedBytes {
+  pdfv1::LoadStatus status = pdfv1::LOAD_STATUS_OK;
+  std::string detail;
+  const std::string* bytes = nullptr;
+  std::shared_ptr<const std::string> cached;
+  bool invalid_argument = false;
+};
+
+ResolvedBytes ResolveDocumentBytes(const pdfv1::PdfDocument& document,
+                                   DocumentCache& cache) {
+  ResolvedBytes out;
+  if (document.data().empty()) {
+    if (!document.has_sha256()) {
+      out.invalid_argument = true;
+      out.detail = "data is empty and sha256 is absent";
+      return out;
+    }
+    out.cached = cache.Lookup(document.sha256());
+    if (out.cached == nullptr) {
+      out.status = pdfv1::LOAD_STATUS_BYTES_REQUIRED;
+      out.detail = "no cached bytes for sha256 " + document.sha256();
+      return out;
+    }
+    out.bytes = out.cached.get();
+    return out;
+  }
+  out.bytes = &document.data();
+  if (!document.has_sha256()) return out;
+  if (Sha256Hex(document.data()) != document.sha256()) {
+    out.status = pdfv1::LOAD_STATUS_HASH_MISMATCH;
+    out.detail = "data does not hash to the given sha256";
+    out.bytes = nullptr;
+    return out;
+  }
+  cache.Insert(document.sha256(), document.data());
+  return out;
+}
+
+void LoadDocument(const std::string& data, const pdfv1::PdfDocument& request,
+                  LoadedDocument* out) {
   if (data.rfind("%PDF-", 0) != 0) {
     out->status = pdfv1::LOAD_STATUS_NOT_PDF;
     out->detail = "missing %PDF- header";
@@ -218,9 +262,18 @@ void FillOutlineItem(const poppler::toc_item* item, pdfv1::OutlineNode* node,
 grpc::Status PopplerServiceImpl::Probe(grpc::ServerContext* /*context*/,
                                        const pdfv1::ProbeRequest* request,
                                        pdfv1::ProbeResponse* response) {
+  const ResolvedBytes resolved = ResolveDocumentBytes(request->document(), cache_);
+  if (resolved.invalid_argument) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
+  }
   PopplerGate gate;
   LoadedDocument loaded;
-  LoadDocument(request->document(), &loaded);
+  if (resolved.status == pdfv1::LOAD_STATUS_OK) {
+    LoadDocument(*resolved.bytes, request->document(), &loaded);
+  } else {
+    loaded.status = resolved.status;
+    loaded.detail = resolved.detail;
+  }
   FillCapabilities(loaded, response->mutable_capabilities());
   return grpc::Status::OK;
 }
@@ -228,9 +281,18 @@ grpc::Status PopplerServiceImpl::Probe(grpc::ServerContext* /*context*/,
 grpc::Status PopplerServiceImpl::Parse(
     grpc::ServerContext* /*context*/, const pdfv1::ParseRequest* request,
     grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
+  const ResolvedBytes resolved = ResolveDocumentBytes(request->document(), cache_);
+  if (resolved.invalid_argument) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
+  }
   PopplerGate gate;
   LoadedDocument loaded;
-  LoadDocument(request->document(), &loaded);
+  if (resolved.status == pdfv1::LOAD_STATUS_OK) {
+    LoadDocument(*resolved.bytes, request->document(), &loaded);
+  } else {
+    loaded.status = resolved.status;
+    loaded.detail = resolved.detail;
+  }
 
   const int page_count =
       loaded.status == pdfv1::LOAD_STATUS_OK ? loaded.doc->pages() : 0;
@@ -464,14 +526,27 @@ grpc::Status PopplerServiceImpl::Render(
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                         "dpi must be positive");
   }
+  const ResolvedBytes resolved = ResolveDocumentBytes(request->document(), cache_);
+  if (resolved.invalid_argument) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
+  }
   PopplerGate gate;
   LoadedDocument loaded;
-  LoadDocument(request->document(), &loaded);
+  if (resolved.status == pdfv1::LOAD_STATUS_OK) {
+    LoadDocument(*resolved.bytes, request->document(), &loaded);
+  } else {
+    loaded.status = resolved.status;
+    loaded.detail = resolved.detail;
+  }
   if (loaded.status != pdfv1::LOAD_STATUS_OK) {
-    return grpc::Status(
-        grpc::StatusCode::FAILED_PRECONDITION,
-        "document did not load: " + pdfv1::LoadStatus_Name(loaded.status) +
-            (loaded.detail.empty() ? "" : " (" + loaded.detail + ")"));
+    // The contract types load failures in a one-message head, never as a
+    // bare gRPC error.
+    pdfv1::RenderResponse head_msg;
+    auto* head = head_msg.mutable_head();
+    head->set_load_status(loaded.status);
+    if (!loaded.detail.empty()) head->set_load_detail(loaded.detail);
+    writer->Write(head_msg);
+    return grpc::Status::OK;
   }
 
   const int page_count = loaded.doc->pages();

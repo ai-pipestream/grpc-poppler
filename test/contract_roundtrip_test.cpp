@@ -12,6 +12,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "poppler_service_impl.h"
+#include "sha256.h"
 
 namespace pdfv1 = ai::protomolt::parse::pdf::v1;
 
@@ -160,6 +161,196 @@ int main(int argc, char** argv) {
     }
     Check(has_ink, "raster has non-white pixels");
     Check(reader->Finish().ok(), "render finished OK");
+  }
+
+  // The content-addressed handshake (PdfDocument.sha256).
+  const std::string hello_hash = grpc_poppler::Sha256Hex(hello);
+  const std::string rich_hash = grpc_poppler::Sha256Hex(rich);
+  Check(hello_hash.size() == 64 && hello_hash != rich_hash,
+        "fixture hashes computed");
+
+  // A first call addressed by hash misses with BYTES_REQUIRED, on every
+  // surface, and never as a gRPC error.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ProbeRequest request;
+    request.mutable_document()->set_sha256(hello_hash);
+    pdfv1::ProbeResponse response;
+    Check(stub->Probe(&ctx, request, &response).ok(),
+          "probe by hash is not a gRPC error");
+    Check(response.capabilities().load_status() ==
+              pdfv1::LOAD_STATUS_BYTES_REQUIRED,
+          "probe by hash misses with BYTES_REQUIRED");
+  }
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_sha256(hello_hash);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    Check(reader->Read(&msg) && msg.has_header(),
+          "parse by hash miss still sends the header");
+    Check(msg.header().capabilities().load_status() ==
+              pdfv1::LOAD_STATUS_BYTES_REQUIRED,
+          "parse header carries BYTES_REQUIRED");
+    Check(!reader->Read(&msg), "stream ends after the failed header");
+    Check(reader->Finish().ok(), "parse by hash miss finished OK");
+  }
+  {
+    grpc::ClientContext ctx;
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_sha256(hello_hash);
+    request.set_dpi(72.0);
+    auto reader = stub->Render(&ctx, request);
+    pdfv1::RenderResponse msg;
+    Check(reader->Read(&msg) && msg.has_head(),
+          "render by hash miss sends a head message");
+    Check(msg.head().load_status() == pdfv1::LOAD_STATUS_BYTES_REQUIRED,
+          "render head carries BYTES_REQUIRED");
+    Check(!reader->Read(&msg), "render stream ends after the head");
+    Check(reader->Finish().ok(), "render by hash miss finished OK");
+  }
+
+  // Empty data with no hash is INVALID_ARGUMENT on every RPC.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ProbeRequest request;
+    pdfv1::ProbeResponse response;
+    Check(stub->Probe(&ctx, request, &response).error_code() ==
+              grpc::StatusCode::INVALID_ARGUMENT,
+          "empty data without sha256 is INVALID_ARGUMENT");
+  }
+
+  // data plus a hash that does not match is HASH_MISMATCH.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ProbeRequest request;
+    request.mutable_document()->set_data(hello);
+    request.mutable_document()->set_sha256(rich_hash);
+    pdfv1::ProbeResponse response;
+    Check(stub->Probe(&ctx, request, &response).ok(),
+          "hash mismatch is not a gRPC error");
+    Check(response.capabilities().load_status() ==
+              pdfv1::LOAD_STATUS_HASH_MISMATCH,
+          "mismatched hash reports HASH_MISMATCH");
+  }
+  {
+    grpc::ClientContext ctx;
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_data(hello);
+    request.mutable_document()->set_sha256(rich_hash);
+    request.set_dpi(72.0);
+    auto reader = stub->Render(&ctx, request);
+    pdfv1::RenderResponse msg;
+    Check(reader->Read(&msg) && msg.has_head(),
+          "render hash mismatch sends a head message");
+    Check(msg.head().load_status() == pdfv1::LOAD_STATUS_HASH_MISMATCH,
+          "render head carries HASH_MISMATCH");
+    Check(!reader->Read(&msg), "render stream ends after the mismatch head");
+  }
+
+  // The retry with bytes succeeds and caches the document.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ProbeRequest request;
+    request.mutable_document()->set_data(hello);
+    request.mutable_document()->set_sha256(hello_hash);
+    pdfv1::ProbeResponse response;
+    Check(stub->Probe(&ctx, request, &response).ok(), "retry with bytes OK");
+    Check(response.capabilities().load_status() == pdfv1::LOAD_STATUS_OK,
+          "retry with bytes loads");
+  }
+
+  // Every RPC now works by hash alone, no bytes on the wire.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ProbeRequest request;
+    request.mutable_document()->set_sha256(hello_hash);
+    pdfv1::ProbeResponse response;
+    Check(stub->Probe(&ctx, request, &response).ok(), "cached probe OK");
+    Check(response.capabilities().load_status() == pdfv1::LOAD_STATUS_OK,
+          "cached probe loads");
+    Check(response.capabilities().page_count() == 1,
+          "cached probe counts the page");
+  }
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_sha256(hello_hash);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    Check(reader->Read(&msg) && msg.has_header(), "cached parse header");
+    Check(msg.header().capabilities().load_status() == pdfv1::LOAD_STATUS_OK,
+          "cached parse loads");
+    Check(msg.header().pages_size() == 1, "cached parse inventories the page");
+    bool saw_trailer = false;
+    while (reader->Read(&msg)) {
+      if (msg.has_trailer()) saw_trailer = true;
+    }
+    Check(saw_trailer, "cached parse ran to the trailer");
+    Check(reader->Finish().ok(), "cached parse finished OK");
+  }
+  {
+    grpc::ClientContext ctx;
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_sha256(hello_hash);
+    request.set_dpi(72.0);
+    auto reader = stub->Render(&ctx, request);
+    pdfv1::RenderResponse msg;
+    Check(reader->Read(&msg) && msg.has_raster(),
+          "cached render produced a raster");
+    Check(msg.raster().width_px() == 612, "cached raster is Letter");
+    Check(reader->Finish().ok(), "cached render finished OK");
+  }
+
+  // A capacity-one cache evicts the older document.
+  {
+    grpc_poppler::PopplerServiceImpl tiny_service({1, 1u << 30});
+    grpc::ServerBuilder tiny_builder;
+    int tiny_port = 0;
+    tiny_builder.AddListeningPort("127.0.0.1:0",
+                                  grpc::InsecureServerCredentials(),
+                                  &tiny_port);
+    tiny_builder.RegisterService(&tiny_service);
+    std::unique_ptr<grpc::Server> tiny_server = tiny_builder.BuildAndStart();
+    Check(tiny_server != nullptr && tiny_port != 0, "tiny-cache server up");
+    auto tiny_stub = pdfv1::PdfBackendService::NewStub(
+        grpc::CreateChannel("127.0.0.1:" + std::to_string(tiny_port),
+                            grpc::InsecureChannelCredentials()));
+    for (const auto& item : {std::pair{&hello, &hello_hash},
+                             std::pair{&rich, &rich_hash}}) {
+      grpc::ClientContext ctx;
+      pdfv1::ProbeRequest request;
+      request.mutable_document()->set_data(*item.first);
+      request.mutable_document()->set_sha256(*item.second);
+      pdfv1::ProbeResponse response;
+      Check(tiny_stub->Probe(&ctx, request, &response).ok() &&
+                response.capabilities().load_status() ==
+                    pdfv1::LOAD_STATUS_OK,
+            "tiny cache stores each upload");
+    }
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ProbeRequest request;
+      request.mutable_document()->set_sha256(hello_hash);
+      pdfv1::ProbeResponse response;
+      Check(tiny_stub->Probe(&ctx, request, &response).ok(),
+            "evicted probe is not a gRPC error");
+      Check(response.capabilities().load_status() ==
+                pdfv1::LOAD_STATUS_BYTES_REQUIRED,
+            "the older document was evicted");
+    }
+    {
+      grpc::ClientContext ctx;
+      pdfv1::ProbeRequest request;
+      request.mutable_document()->set_sha256(rich_hash);
+      pdfv1::ProbeResponse response;
+      Check(tiny_stub->Probe(&ctx, request, &response).ok() &&
+                response.capabilities().load_status() ==
+                    pdfv1::LOAD_STATUS_OK,
+            "the newest document survives eviction");
+    }
+    tiny_server->Shutdown();
   }
 
   server->Shutdown();

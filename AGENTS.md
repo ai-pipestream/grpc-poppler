@@ -22,3 +22,13 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   excluded from default release artifacts. It exists as the
   extraction-quality reference and the differential leg; keep its tier 0
   behaviour matching gRParse's in-process poppler path to the pixel.
+- **The content-addressed handshake** (`PdfDocument.sha256`) is served from
+  an in-process LRU byte cache (`src/document_cache.h`), resolved once for
+  all three RPCs in `ResolveDocumentBytes` (`src/poppler_service_impl.cpp`).
+  Cache misses and hash mismatches are typed `LoadStatus` verdicts
+  (`BYTES_REQUIRED` on `Probe` capabilities / `Parse` header / `Render`
+  head), never gRPC errors; empty `data` with no `sha256` is
+  INVALID_ARGUMENT. Bounds: `GRPC_POPPLER_CACHE_MAX_DOCUMENTS` (default 8)
+  and `GRPC_POPPLER_CACHE_MAX_BYTES` (default 2 GiB). SHA-256 is boringssl's
+  `SHA256` (`src/sha256.cpp`), linked from the `crypto` target gRPC already
+  builds; do not add another crypto dependency.

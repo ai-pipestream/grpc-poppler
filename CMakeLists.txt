@@ -30,16 +30,16 @@ FetchContent_MakeAvailable(grpc)
 # fetched from the parser-protos repo at a pinned commit; gRParse backends/
 # holds the same bytes.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_COMMIT "fba7556c073dba4f907a94841c358424c6786962"
+set(PDF_PROTOS_COMMIT "4d72ec2c4550f8110ba03550f659c931d57e024d"
     CACHE STRING "parser-protos commit the contract comes from")
 set(PDF_PROTOS_BASE_URL
     "https://git.rokkon.com/ai-pipestream/parser-protos/raw/commit/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
     CACHE STRING "base URL the contract proto files are downloaded from")
 set(PDF_PROTO_TYPES_SHA256
-    "86c4bc05e92e640d2defdfac861cf9cea747da3cb38268f933380a4f76bb0fda"
+    "5570baad185a6f008976c8f013a48382b04c83b54a60ccdf94b0cd0a65bf2cce"
     CACHE STRING "sha256 of pdf_backend_types.proto")
 set(PDF_PROTO_SERVICE_SHA256
-    "b50b551beb869af100860c6be1bca8832fff27622be0a6f882fb347e72792a98"
+    "ae8ae5bb765e771b98176501ffc59583bf0c0428b7aa45e37e011f1e02aeeecd"
     CACHE STRING "sha256 of pdf_backend_service.proto")
 set(PDF_PROTO_LOCAL_DIR "" CACHE PATH "directory holding the contract protos, instead of the pinned download")
 
@@ -114,13 +114,16 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
 
 # ---------------------------------------------------------------------------
-# The service binary.
+# The service binary. SHA-256 for the content-addressed cache comes from the
+# boringssl crypto target gRPC already builds (no new dependency).
 # ---------------------------------------------------------------------------
 add_executable(grpc_poppler
   src/main.cpp
-  src/poppler_service_impl.cpp)
+  src/poppler_service_impl.cpp
+  src/document_cache.cpp
+  src/sha256.cpp)
 target_include_directories(grpc_poppler PRIVATE src)
-target_link_libraries(grpc_poppler PRIVATE pdf_backend_proto PkgConfig::POPPLER_CPP grpc_poppler_flags)
+target_link_libraries(grpc_poppler PRIVATE pdf_backend_proto PkgConfig::POPPLER_CPP crypto grpc_poppler_flags)
 
 # ---------------------------------------------------------------------------
 # Tests.
@@ -128,8 +131,10 @@ target_link_libraries(grpc_poppler PRIVATE pdf_backend_proto PkgConfig::POPPLER_
 enable_testing()
 add_executable(poppler_contract_test
   test/contract_roundtrip_test.cpp
-  src/poppler_service_impl.cpp)
+  src/poppler_service_impl.cpp
+  src/document_cache.cpp
+  src/sha256.cpp)
 target_include_directories(poppler_contract_test PRIVATE src)
-target_link_libraries(poppler_contract_test PRIVATE pdf_backend_proto PkgConfig::POPPLER_CPP grpc_poppler_flags)
+target_link_libraries(poppler_contract_test PRIVATE pdf_backend_proto PkgConfig::POPPLER_CPP crypto grpc_poppler_flags)
 add_test(NAME poppler_contract COMMAND poppler_contract_test
   "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")

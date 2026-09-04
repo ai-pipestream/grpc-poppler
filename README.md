@@ -36,6 +36,30 @@ GRPC_POPPLER_PORT=50053 ./build/grpc_poppler
 Health and server reflection are enabled; `Probe`, `Parse`, and `Render`
 are the service surface.
 
+## Content-addressed documents
+
+The contract lets a client upload the PDF bytes once and address them by
+hash on later calls: a request with `data` empty and `PdfDocument.sha256`
+set is a cache lookup. On a miss the service answers
+`LOAD_STATUS_BYTES_REQUIRED` (typed, never a gRPC error) and the client
+retries exactly once with the bytes; a `data` plus `sha256` request whose
+bytes do not hash to the given value gets `LOAD_STATUS_HASH_MISMATCH`.
+On `Render`, load failures of any kind arrive as a single
+`RenderResponse.head` message and the stream ends.
+
+The bytes live in an in-process LRU cache (grpc-poppler is single-process,
+so the cache sits beside the RPC surface; on grpc-pdfium it belongs in the
+front process, which owns the client-facing wire). Two env knobs bound it:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `GRPC_POPPLER_CACHE_MAX_DOCUMENTS` | `8` | most documents held at once |
+| `GRPC_POPPLER_CACHE_MAX_BYTES` | `2147483648` (2 GiB) | total cached bytes |
+
+Setting either to `0` disables caching; a document larger than the byte
+ceiling is never stored. SHA-256 comes from the boringssl `crypto` target
+the gRPC build already compiles; there is no new dependency.
+
 ## Compose profile
 
 `compose.yml` defines the service under the `differential` profile, so a
