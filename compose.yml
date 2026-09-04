@@ -1,0 +1,11 @@
+# The GPL differential leg. Profile-gated: a plain `docker compose up`
+# never starts it; `docker compose --profile differential up` does.
+services:
+  grpc-poppler:
+    build: .
+    image: grpc-poppler:latest
+    profiles: ["differential"]
+    ports:
+      - "50053:50053"
+    environment:
+      GRPC_POPPLER_PORT: "50053"
