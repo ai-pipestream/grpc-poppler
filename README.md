@@ -8,7 +8,7 @@ extraction-quality reference and the differential leg, not as part of the
 default stack.
 
 Implements the fleet's common `PdfBackendService` contract
-(`ai.pipestream.parse.pdf.v1`, from the pinned pipestream-protos release).
+(`ai.pipestream.parse.pdf.v1`, from the pinned parser-protos commit).
 The tier 0 floor mirrors the exact poppler-cpp usage of gRParse's
 in-process path: `load_from_raw_data`, `text_list(text_list_include_font)`
 word boxes, BGR24 rasters at a requested DPI, quarter-turn page geometry,
