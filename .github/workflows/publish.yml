@@ -1,9 +1,10 @@
 name: Publish Images
 
-# Builds the service image and pushes it to docker.io/pipestreamai. Every
-# push to main republishes :latest; a manual dispatch with a version input
-# also tags that version. Docker Hub credentials come from the DOCKER_USER /
-# DOCKER_TOKEN org secrets.
+# Builds the service image (the build stage runs the test suite), boot-proofs
+# the runtime stage with scripts/smoke-test.sh, and only then pushes it to
+# docker.io/pipestreamai. Every push to main republishes :latest; a manual
+# dispatch with a version input also tags that version. Docker Hub
+# credentials come from the DOCKER_USER / DOCKER_TOKEN org secrets.
 #
 # amd64-only: the C++ services publish amd64 only (emulated arm64 C++ builds
 # are too slow), so no QEMU setup and a single linux/amd64 platform.
@@ -32,25 +33,37 @@ jobs:
           password: ${{ secrets.DOCKER_TOKEN }}
       - name: Compute tags and build version
         id: tags
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
+          set -euo pipefail
           svc="docker.io/pipestreamai/grpc-poppler:latest"
-          version="dev"
-          if [ -n "${{ inputs.version }}" ]; then
-            svc="$svc,docker.io/pipestreamai/grpc-poppler:${{ inputs.version }}"
-            version="${{ inputs.version }}"
+          if [ -n "$VERSION" ]; then
+            svc="$svc,docker.io/pipestreamai/grpc-poppler:$VERSION"
+            version="$VERSION"
           else
             version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
           fi
-          echo "svc=$svc" >> "$GITHUB_OUTPUT"
-          echo "build_version=$version" >> "$GITHUB_OUTPUT"
-      - name: Build and push the service image
+          {
+            echo "svc=$svc"
+            echo "push_tags=$(tr ',' ' ' <<<"$svc")"
+            echo "build_version=$version"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build the service image (runs the test suite in the build stage)
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          push: true
+          load: true
           provenance: false
           sbom: false
           tags: ${{ steps.tags.outputs.svc }}
           build-args: |
             GRPC_POPPLER_BUILD_VERSION=${{ steps.tags.outputs.build_version }}
+      - name: Boot-proof the image before any push
+        run: ./scripts/smoke-test.sh docker.io/pipestreamai/grpc-poppler:latest
+      - name: Push all tags
+        run: |
+          for tag in ${{ steps.tags.outputs.push_tags }}; do
+            docker push "$tag"
+          done

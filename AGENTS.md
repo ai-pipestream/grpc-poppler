@@ -44,9 +44,24 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   (configure with `-DGRPC_POPPLER_BUILD_VERSION=...`; the Dockerfile takes
   it as a build arg and the publish workflow passes the version tag, `dev`
   is the fallback).
-- **Publishing**: `.github/workflows/publish.yml` pushes
-  `docker.io/pipestreamai/grpc-poppler:latest` on every push to `main`
-  (amd64 only, the C++ family rule) and a `:<version>` tag via
-  `workflow_dispatch`; auth is the `DOCKER_USER` / `DOCKER_TOKEN` org
+- **The image**: multi-stage on a Debian trixie toolchain. The build
+  stage builds poppler 26.08.0 from the sha256-pinned tarball (cpp
+  frontend and splash only, gRParse's version and option set, never the
+  distro's), compiles against it (`PKG_CONFIG_PATH=/opt/poppler/lib/pkgconfig`)
+  and runs the full ctest suite as the gate. The runtime is the hardened
+  `dhi.io/debian-base:trixie-debian13` base (glibc only, no package
+  manager, no ldconfig, uid 65532) carrying the binary, the staged
+  shared-library closure (`scripts/stage-runtime-libs.sh`, held to one
+  libpoppler major) under `/usr/local/lib` on `LD_LIBRARY_PATH`, the
+  Liberation/DejaVu fonts, fontconfig's configuration (Debian keeps the
+  conf.d targets under `/usr/share/fontconfig`, so that tree travels
+  too) and a prebuilt font cache. The build stage must stay on a glibc no
+  newer than the runtime base's (2.41). `GRPC_POPPLER_RUNTIME_IMAGE`
+  swaps the base. `scripts/smoke-test.sh IMAGE` is the boot gate (closure,
+  boot to listening under the hardened flags, uid).
+- **Publishing**: `.github/workflows/publish.yml` builds, smoke-tests, and
+  only then pushes `docker.io/pipestreamai/grpc-poppler:latest` on every
+  push to `main` (amd64 only, the C++ family rule) and a `:<version>` tag
+  via `workflow_dispatch`; auth is the `DOCKER_USER` / `DOCKER_TOKEN` org
   secrets. `.github/workflows/ci.yml` builds the image (the Dockerfile's
-  build stage runs the full ctest suite) and boot-proofs the runtime image.
+  build stage runs the full ctest suite) and runs the same smoke test.

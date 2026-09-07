@@ -137,6 +137,11 @@ target_link_libraries(pdf_backend_proto PUBLIC grpc++ grpc++_reflection libproto
 # ---------------------------------------------------------------------------
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
+# poppler-cpp.pc puts <includedir>/poppler/cpp on the include path, which
+# only resolves the <poppler/cpp/...> includes below when includedir is a
+# default search root (/usr/include). A poppler built under its own prefix
+# (the image's /opt/poppler) needs the includedir itself on the path too.
+target_include_directories(PkgConfig::POPPLER_CPP INTERFACE "${POPPLER_CPP_INCLUDEDIR}")
 
 # ---------------------------------------------------------------------------
 # The service binary. SHA-256 for the content-addressed cache comes from the
