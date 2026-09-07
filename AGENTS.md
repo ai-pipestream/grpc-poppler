@@ -61,7 +61,12 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   boot to listening under the hardened flags, uid).
 - **Publishing**: `.github/workflows/publish.yml` builds, smoke-tests, and
   only then pushes `docker.io/pipestreamai/grpc-poppler:latest` on every
-  push to `main` (amd64 only, the C++ family rule) and a `:<version>` tag
-  via `workflow_dispatch`; auth is the `DOCKER_USER` / `DOCKER_TOKEN` org
-  secrets. `.github/workflows/ci.yml` builds the image (the Dockerfile's
-  build stage runs the full ctest suite) and runs the same smoke test.
+  push to `main` and a `:<version>` tag via `workflow_dispatch`; auth is the
+  `DOCKER_USER` / `DOCKER_TOKEN` org secrets. Each architecture (linux/amd64
+  on GitHub-hosted runners, linux/arm64 natively on GitHub's hosted arm64
+  runner) builds with provenance and SBOM attestations, pushes by digest
+  only, and smoke-tests its own digest; `scripts/publish-manifests.sh`
+  assembles the passing digests into the tags and verifies the index lists
+  exactly both platforms with one attestation manifest per platform.
+  `.github/workflows/ci.yml` builds the image (the Dockerfile's build stage
+  runs the full ctest suite) and runs the same smoke test.

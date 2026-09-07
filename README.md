@@ -117,10 +117,16 @@ docker compose --profile differential up grpc-poppler
 ## Image publishing
 
 `.github/workflows/publish.yml` republishes `docker.io/pipestreamai/grpc-poppler:latest`
-on every push to `main` and adds a `:<version>` tag via `workflow_dispatch`
-(amd64 only, like the other C++ services; Docker Hub auth is the
-`DOCKER_USER` / `DOCKER_TOKEN` org secrets). The workflow passes the version
-tag as the `GRPC_POPPLER_BUILD_VERSION` build arg so `GetServiceInfo`
+on every push to `main` and adds a `:<version>` tag via `workflow_dispatch`.
+The image is a linux/amd64 + linux/arm64 manifest list: the amd64 leg builds
+on GitHub-hosted runners, the arm64 leg natively on GitHub's hosted arm64
+runner (Docker Hub auth is the `DOCKER_USER` / `DOCKER_TOKEN` org secrets).
+Each leg builds with provenance and SBOM attestations, pushes by digest only,
+and boot-proofs its own digest with `scripts/smoke-test.sh` before the
+`publish` job assembles the passing digests into the tags with
+`scripts/publish-manifests.sh` (which fails unless the index lists exactly
+both platforms with one attestation manifest each). The workflow passes the
+version tag as the `GRPC_POPPLER_BUILD_VERSION` build arg so `GetServiceInfo`
 reports it. `.github/workflows/ci.yml` builds the image on push and PR (the
 build stage runs the full ctest suite) and boot-proofs the runtime image
 with `scripts/smoke-test.sh`; the publish workflow runs the same smoke test

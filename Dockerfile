@@ -58,22 +58,30 @@ COPY scripts ./scripts
 # Reported by GetServiceInfo; the publish workflow passes the version tag.
 ARG GRPC_POPPLER_BUILD_VERSION=dev
 
-# The cache id encodes every ABI-sensitive dependency; bump it when gRPC,
-# poppler, or the toolchain moves. The contract protos are downloaded from
-# the pinned parser-protos commit at configure time (sha256-verified), so
-# the build needs network access.
+# The cache id encodes the target platform and every ABI-sensitive
+# dependency; bump the dependency part when gRPC, poppler, or the toolchain
+# moves. The platform is in the id because the multi-arch publish legs share
+# this cache mount and an amd64 tree is worthless to (and huge beside) an
+# arm64 leg. The contract protos are downloaded from the pinned
+# parser-protos commit at configure time (sha256-verified), so the build
+# needs network access.
 # Compile parallelism is bounded: an unbounded build on a shared builder
-# starves its neighbours and gets the compiler OOM-killed; 8 jobs is what
-# the gRPC compile tolerates beside other builds.
+# starves its neighbours and gets the compiler OOM-killed. 8 jobs is what
+# the gRPC compile tolerates beside other builds; the arm64 publish leg
+# passes 4 for its 4-core hosted runner. The poppler build stays at
+# 4, right for both pools.
 # A second builder sharing this cache mount (a developer build beside a CI
 # run, or an interrupted build that left a truncated object behind) gets its
 # own tree through --build-arg GRPC_POPPLER_BUILD_CACHE_SCOPE=-<name>.
 ARG GRPC_POPPLER_BUILD_CACHE_SCOPE=
-RUN --mount=type=cache,id=grpc-poppler-trixie-grpc1.83.1-poppler26.08${GRPC_POPPLER_BUILD_CACHE_SCOPE},target=/build \
+# Predefined build arg; declared so the cache mount id can key on it.
+ARG TARGETPLATFORM
+ARG GRPC_POPPLER_BUILD_JOBS=8
+RUN --mount=type=cache,id=grpc-poppler-${TARGETPLATFORM}-trixie-grpc1.83.1-poppler26.08${GRPC_POPPLER_BUILD_CACHE_SCOPE},target=/build \
     export PKG_CONFIG_PATH=/opt/poppler/lib/pkgconfig \
  && cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release \
         -DGRPC_POPPLER_BUILD_VERSION="${GRPC_POPPLER_BUILD_VERSION}" \
-    && cmake --build /build --parallel 8 \
+    && cmake --build /build --parallel "${GRPC_POPPLER_BUILD_JOBS}" \
     && LD_LIBRARY_PATH=/opt/poppler/lib ctest --test-dir /build --output-on-failure \
     && mkdir -p /out/lib && cp /build/grpc_poppler /out/ \
     && LD_LIBRARY_PATH=/opt/poppler/lib scripts/stage-runtime-libs.sh /out/lib /out/grpc_poppler \
