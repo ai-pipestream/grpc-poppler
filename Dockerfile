@@ -89,24 +89,35 @@ RUN --mount=type=cache,id=grpc-poppler-trixie-grpc1.83.1-poppler26.08${GRPC_POPP
 # rasterizes non-embedded text to different pixels than its siblings, and a
 # page the images disagree about cannot be compared between them. This
 # image asks for the same fonts gRParse's images do, explicitly.
+# A cache file is valid only while its font directory's mtime equals the
+# one recorded at fc-cache time, so the fonts, fontconfig's configuration
+# (Debian keeps the conf.d targets under /usr/share/fontconfig) and the
+# cache are staged as one tree and shipped by one COPY: separate COPYs let
+# the layer cache pair a reused font layer with a newer cache (its key
+# hashes content, not directory mtimes), and the read-only runtime then
+# logs "No writable cache directories" and rescans the fonts on first use.
+# The directory mtimes are pinned before fc-cache so the cache contents,
+# and with them the layer, are the same from one build to the next.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation fonts-dejavu-core fontconfig \
     && rm -rf /var/lib/apt/lists/* \
-    && fc-cache -f
+    && find /usr/share/fonts /usr/local/share/fonts -type d -exec touch -d @1 {} + \
+    && fc-cache -f \
+    && mkdir -p /out/fonts/usr/share /out/fonts/var/cache /out/fonts/etc \
+    && cp -a /usr/share/fonts /usr/share/fontconfig /out/fonts/usr/share/ \
+    && cp -a /etc/fonts /out/fonts/etc/ \
+    && cp -a /var/cache/fontconfig /out/fonts/var/cache/
 
 # LD_LIBRARY_PATH stands in for ldconfig, and the numeric USER works with or
 # without a passwd entry (65532 is the conventional nonroot uid in hardened
 # images).
 FROM ${GRPC_POPPLER_RUNTIME_IMAGE}
 COPY --from=build /out/lib/ /usr/local/lib/
-# Fontconfig's configuration (Debian keeps the conf.d targets under
-# /usr/share/fontconfig), the Liberation and DejaVu fonts, and the prebuilt
-# font cache: PDFs with embedded fonts never need any of this, but
-# non-embedded base-14 text would otherwise come out blank.
-COPY --from=build /etc/fonts /etc/fonts
-COPY --from=build /usr/share/fontconfig /usr/share/fontconfig
-COPY --from=build /usr/share/fonts /usr/share/fonts
-COPY --from=build /var/cache/fontconfig /var/cache/fontconfig
+# Fontconfig's configuration, the Liberation and DejaVu fonts, and the
+# prebuilt font cache, as the one tree staged above: PDFs with embedded
+# fonts never need any of this, but non-embedded base-14 text would
+# otherwise come out blank.
+COPY --from=build /out/fonts/ /
 COPY --from=build /out/grpc_poppler /usr/local/bin/grpc_poppler
 ENV GRPC_POPPLER_PORT=50071 \
     LD_LIBRARY_PATH=/usr/local/lib

@@ -57,6 +57,16 @@ docker run -d --name "$container" \
   --read-only --cap-drop ALL --security-opt no-new-privileges:true \
   "$image" >/dev/null
 wait_for_log "grpc-poppler listening on" 60
+# The prebuilt cache must be accepted as it is: fontconfig complaining
+# about cache directories means it rescans the fonts instead. Poppler
+# touches fontconfig only when a document needs a substitute font, so this
+# catches complaints raised at startup; the build keeps the fonts and the
+# cache in one staged tree so they cannot disagree later.
+if docker logs "$container" 2>&1 | grep -q "Fontconfig error"; then
+  echo "fontconfig rejected the prebuilt cache; logs:" >&2
+  docker logs "$container" >&2 || true
+  exit 1
+fi
 
 processes=$(docker top "$container" -o uid,pid,args | tail -n +2)
 echo "$processes"
