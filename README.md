@@ -22,10 +22,13 @@ with the reason; deep graphics resources are not poppler's to give.
 ## Build and test
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # links the host poppler-cpp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # links the poppler-cpp pkg-config finds
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+A local build links whatever `poppler-cpp` pkg-config finds; the image
+builds poppler 26.08.0 from the pinned tarball instead (see Docker below).
 
 ## Run
 
@@ -65,6 +68,43 @@ Setting either to `0` disables caching; a document larger than the byte
 ceiling is never stored. SHA-256 comes from the boringssl `crypto` target
 the gRPC build already compiles; there is no new dependency.
 
+## Docker
+
+```bash
+docker build -t grpc-poppler .
+docker run --rm --read-only -p 50071:50071 grpc-poppler
+scripts/smoke-test.sh grpc-poppler     # boot-proof a built image
+```
+
+The build stage (a Debian trixie toolchain) builds poppler 26.08.0 from the
+sha256-pinned tarball (cpp frontend and splash renderer only, the same
+version and option set gRParse's own images vendor, so the two poppler
+paths stay comparable to the pixel), compiles the service against it, and
+runs the full ctest suite as the image gate. A distro poppler is not used:
+it predates the 26.06 thread-safety fixes in annots loading and would
+differ from the path this service is the reference for.
+
+The runtime stage is the hardened `dhi.io/debian-base:trixie-debian13`
+base: glibc and nothing else, no package manager, no ldconfig, and the
+service runs as uid 65532 out of the box, so no `--user` flag is needed.
+The binary's whole shared-library closure beyond glibc (poppler, freetype,
+fontconfig, jpeg, openjpeg, lcms2, libstdc++ and their dependencies) is
+staged from the build stage into `/usr/local/lib` on `LD_LIBRARY_PATH` by
+`scripts/stage-runtime-libs.sh`, which fails the build if anything would
+resolve from outside it; the image is also held to exactly one libpoppler
+major in the load set. The Liberation and DejaVu fonts ride along as
+poppler's base-14 substitutes (non-embedded Helvetica/Times/Courier text
+would otherwise come out blank), with fontconfig's configuration and a
+prebuilt font cache so a read-only container never writes one. The base
+is swappable with `--build-arg GRPC_POPPLER_RUNTIME_IMAGE=<image>` for any
+image whose glibc is 2.41 or newer.
+
+`scripts/smoke-test.sh IMAGE` is the boot gate CI and the publish workflow
+run before any push: the library closure resolves inside the image (the
+dynamic loader reports it, since the base has no `ldd`), the server
+reaches its "listening on" line under `--read-only --cap-drop ALL`, and
+every process runs as uid 65532.
+
 ## Compose profile
 
 `compose.yml` defines the service under the `differential` profile, so a
@@ -82,5 +122,6 @@ on every push to `main` and adds a `:<version>` tag via `workflow_dispatch`
 `DOCKER_USER` / `DOCKER_TOKEN` org secrets). The workflow passes the version
 tag as the `GRPC_POPPLER_BUILD_VERSION` build arg so `GetServiceInfo`
 reports it. `.github/workflows/ci.yml` builds the image on push and PR (the
-build stage runs the full ctest suite) and boot-proofs the runtime image on
-its default port.
+build stage runs the full ctest suite) and boot-proofs the runtime image
+with `scripts/smoke-test.sh`; the publish workflow runs the same smoke test
+before it pushes.
