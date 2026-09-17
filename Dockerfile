@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.26
+# syntax=docker/dockerfile:1.27
 # GPL-3.0-or-later image: links Poppler. Off the default release path;
 # built only for the differential profile. This service is the
 # extraction-quality reference of the PDF backend fleet, so its poppler is
