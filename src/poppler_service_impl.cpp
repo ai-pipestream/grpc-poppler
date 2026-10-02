@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,7 @@
 #include <poppler/cpp/poppler-version.h>
 
 #include "document_cache.h"
+#include "poppler_forms.h"
 #include "sha256.h"
 
 namespace grpc_poppler {
@@ -62,6 +64,7 @@ bool FamilySupported(pdfv1::PdfFamily family) {
     case pdfv1::PDF_FAMILY_ENCRYPTION_INFO:
     case pdfv1::PDF_FAMILY_OUTLINE:
     case pdfv1::PDF_FAMILY_ATTACHMENTS:
+    case pdfv1::PDF_FAMILY_FORM_FIELDS:
       return true;
     default:
       return false;
@@ -71,7 +74,6 @@ bool FamilySupported(pdfv1::PdfFamily family) {
 const char* UnsupportedDetail(pdfv1::PdfFamily family) {
   switch (family) {
     case pdfv1::PDF_FAMILY_ANNOTATIONS:
-    case pdfv1::PDF_FAMILY_FORM_FIELDS:
     case pdfv1::PDF_FAMILY_STRUCT_TREE:
       return "reachable through poppler's glib surface, not the cpp wrapper "
              "this build links; planned";
@@ -455,6 +457,16 @@ grpc::Status PopplerServiceImpl::Parse(
   std::map<pdfv1::PdfFamily, uint64_t> counts;
   counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
   const bool want_text = WantFamily(*request, pdfv1::PDF_FAMILY_TEXT_CELLS);
+  // Form widgets come from poppler's core API (src/poppler_forms.h); the
+  // cpp wrapper has no forms surface.
+  std::map<int, std::vector<pdfv1::FormField>> form_fields;
+  if (WantFamily(*request, pdfv1::PDF_FAMILY_FORM_FIELDS)) {
+    std::optional<std::string> password;
+    if (request->document().has_password()) {
+      password = request->document().password();
+    }
+    form_fields = ReadFormFields(*resolved.bytes, password, begin, end);
+  }
   for (int i = begin; client_ok && i < end; ++i) {
     poppler::page* page = pages[static_cast<size_t>(i)].get();
     if (page == nullptr) continue;
@@ -510,6 +522,12 @@ grpc::Status PopplerServiceImpl::Parse(
       }
     }
     if (!client_ok) break;
+    if (auto found = form_fields.find(i); found != form_fields.end()) {
+      for (auto& field : found->second) {
+        *chunk->add_form_fields() = std::move(field);
+        ++counts[pdfv1::PDF_FAMILY_FORM_FIELDS];
+      }
+    }
     client_ok = writer->Write(page_msg);
   }
   if (!client_ok) return grpc::Status::OK;

@@ -8,6 +8,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 
@@ -113,12 +114,14 @@ int main(int argc, char** argv) {
     int attachments = 0;
     std::string attachment_data;
     bool font_named = false;
+    std::vector<pdfv1::FormField> form_fields;
     std::map<int, uint64_t> counts;
     while (reader->Read(&msg)) {
       if (msg.has_page()) {
         for (const auto& cell : msg.page().text_cells()) {
           all_text += cell.text() + " ";
         }
+        for (const auto& f : msg.page().form_fields()) form_fields.push_back(f);
       } else if (msg.has_doc_meta()) {
         title = msg.doc_meta().title();
         xmp = msg.doc_meta().xmp_xml();
@@ -149,6 +152,34 @@ int main(int argc, char** argv) {
           "attachment bytes round-tripped");
     Check(font_named, "font table names Helvetica");
     Check(counts[pdfv1::PDF_FAMILY_TEXT_CELLS] >= 1, "trailer counts cells");
+
+    // AcroForm widgets, read through poppler's core API, in /Annots order.
+    Check(form_fields.size() == 2, "both form field widgets extracted");
+    Check(counts[pdfv1::PDF_FAMILY_FORM_FIELDS] == 2, "trailer counts widgets");
+    if (form_fields.size() == 2) {
+      const auto& text = form_fields[0];
+      Check(text.kind() == pdfv1::FORM_FIELD_KIND_TEXT, "text field kind");
+      Check(text.name() == "customer_name", "text field name");
+      Check(text.value() == "Jordan Example", "text field value");
+      Check(text.alternate_name() == "Customer name", "text field tooltip");
+      Check(text.has_flags() && text.flags() == 0 && !text.read_only(),
+            "an absent /Ff is the empty mask");
+      Check(!text.has_appearance_state(), "text widget has no /AS");
+      Check(text.rect().x0() == 300 && text.rect().y0() == 300 &&
+                text.rect().x1() == 450 && text.rect().y1() == 320,
+            "text widget rect in page space");
+      // /FT and /Ff (ReadOnly) come from the parent field; /AS from the
+      // widget annotation.
+      const auto& box = form_fields[1];
+      Check(box.kind() == pdfv1::FORM_FIELD_KIND_CHECK_BOX,
+            "check box kind inherited from the parent field");
+      Check(box.name() == "agree", "check box takes the parent's name");
+      Check(box.has_flags() && box.flags() == 1, "/Ff inherited from the parent");
+      Check(box.read_only(), "read-only follows the inherited /Ff");
+      Check(box.appearance_state() == "/Yes", "/AS keeps the leading slash");
+      Check(box.value() == "Yes", "button value is the state name");
+      Check(box.alternate_name() == "I agree", "check box tooltip inherited");
+    }
   }
 
   // Render hello.pdf at 72 DPI: BGR24, the same surface gRParse consumes.

@@ -15,9 +15,15 @@ word boxes, BGR24 rasters at a requested DPI, quarter-turn page geometry,
 and the arm64 serialization gate. On top of the floor, the cpp surface
 fills document metadata (info keys plus the XMP packet), permission bits
 for encrypted documents, the outline, embedded files, and the document
-font table. Annotations, form fields, and the structure tree need
-poppler's glib surface and are reported unsupported by this build, each
-with the reason; deep graphics resources are not poppler's to give.
+font table. AcroForm widgets (form fields) come from poppler's core API,
+which the cpp wrapper does not expose: `src/poppler_forms.cpp` opens a
+core document over the same bytes and reports each widget with its
+inherited field type, /Ff flags and tooltip and the widget's own /AS
+appearance state. The poppler build installs the core headers for this
+(`ENABLE_UNSTABLE_API_ABI_HEADERS`); the library is the one poppler-cpp
+already links. Annotations and the structure tree are still reported
+unsupported, each with the reason; deep graphics resources are not
+poppler's to give.
 
 ## Build and test
 
@@ -27,7 +33,9 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-A local build links whatever `poppler-cpp` pkg-config finds; the image
+A local build links whatever `poppler-cpp` and `poppler` pkg-config find,
+and needs poppler's core headers installed (a distro `libpoppler-private-dev`
+or a poppler built with `ENABLE_UNSTABLE_API_ABI_HEADERS=ON`); the image
 builds poppler 26.08.0 from the pinned tarball instead (see Docker below).
 
 ## Run
