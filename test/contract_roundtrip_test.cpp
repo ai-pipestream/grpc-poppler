@@ -4,7 +4,8 @@
 // document families (metadata with XMP, outline, attachments, fonts) over
 // the hello.pdf and rich.pdf fixtures, the page frame on rotated and
 // cropped pages (frames.pdf), names that are not UTF-8 in the file and a
-// decode cap (encodings.pdf), pages poppler cannot load
+// decode cap (encodings.pdf), attachments whose data cannot be had whole
+// (damaged_attachments.pdf), pages poppler cannot load
 // (missing_pages.pdf), page ranges, Render bounds, and the arm64 gate under
 // a stalled client.
 
@@ -17,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -25,6 +27,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include "poppler_attachments.h"
 #include "poppler_service_impl.h"
 #include "sha256.h"
 
@@ -85,8 +88,11 @@ int main(int argc, char** argv) {
   const std::string frames = ReadFile(dir + "/frames.pdf");
   const std::string encodings = ReadFile(dir + "/encodings.pdf");
   const std::string missing_pages = ReadFile(dir + "/missing_pages.pdf");
+  const std::string damaged_attachments =
+      ReadFile(dir + "/damaged_attachments.pdf");
   Check(!hello.empty() && !rich.empty() && !frames.empty() &&
-            !encodings.empty() && !missing_pages.empty(),
+            !encodings.empty() && !missing_pages.empty() &&
+            !damaged_attachments.empty(),
         "fixtures read");
 
   grpc_poppler::PopplerServiceImpl service;
@@ -284,13 +290,14 @@ int main(int argc, char** argv) {
   // arrive as UTF-8 whatever their encoding in the file; the MIME type, a
   // PDF name, is made valid UTF-8, since the client cannot parse a message
   // whose string field is not and would lose the whole stream.
-  auto parse_attachments = [&encodings](pdfv1::PdfBackendService::Stub& client,
-                                        std::map<std::string, pdfv1::AttachmentMeta>* found,
-                                        std::vector<pdfv1::ParseWarning>* warnings) {
+  auto parse_attachments = [](pdfv1::PdfBackendService::Stub& client,
+                               const std::string& document,
+                               std::map<std::string, pdfv1::AttachmentMeta>* found,
+                               std::vector<pdfv1::ParseWarning>* warnings) {
     grpc::ClientContext ctx;
     SetDeadline(&ctx);
     pdfv1::ParseRequest request;
-    request.mutable_document()->set_data(encodings);
+    request.mutable_document()->set_data(document);
     request.add_families(pdfv1::PDF_FAMILY_ATTACHMENTS);
     request.mutable_options()->set_include_attachment_data(true);
     auto reader = client.Parse(&ctx, request);
@@ -309,7 +316,7 @@ int main(int argc, char** argv) {
   {
     std::map<std::string, pdfv1::AttachmentMeta> found;
     std::vector<pdfv1::ParseWarning> warnings;
-    Check(parse_attachments(*stub, &found, &warnings),
+    Check(parse_attachments(*stub, encodings, &found, &warnings),
           "encodings.pdf attachments stream finishes OK");
     Check(found.size() == 3, "all three attachments listed");
     Check(found.count(resume_name) == 1, "a UTF-16 /UF name is decoded");
@@ -326,14 +333,63 @@ int main(int argc, char** argv) {
     Check(found.count("zeros.bin") == 1 &&
               found["zeros.bin"].data() == std::string(65536, '\0'),
           "an attachment under the cap carries all its inflated bytes");
-    Check(warnings.empty(), "no warnings under the default cap");
+    // zeros.bin declares /Params /Size 16 and inflates to 65536 bytes; the
+    // mismatch is the one sign poppler gives of a damaged stream, so the
+    // trailer names it. The others decode to their declared sizes.
+    Check(warnings.size() == 1 &&
+              warnings[0].family() == pdfv1::PDF_FAMILY_ATTACHMENTS &&
+              warnings[0].message().find("zeros.bin") != std::string::npos &&
+              warnings[0].message().find("/Size 16") != std::string::npos,
+          "the trailer warns only about the size mismatch");
+  }
+  // Attachments whose data cannot be had whole
+  // (test/fixtures/make_damaged_attachments_pdf.py) are still listed, and
+  // the trailer says what went wrong with each.
+  {
+    std::map<std::string, pdfv1::AttachmentMeta> found;
+    std::vector<pdfv1::ParseWarning> warnings;
+    Check(parse_attachments(*stub, damaged_attachments, &found, &warnings),
+          "damaged_attachments.pdf attachments stream finishes OK");
+    Check(found.size() == 2, "both damaged attachments are listed");
+    Check(found.count("lost.txt") == 1 && !found["lost.txt"].has_data(),
+          "an attachment without an embedded stream has no data");
+    auto warned = [&warnings](const std::string& name, const std::string& why) {
+      for (const auto& warning : warnings) {
+        if (warning.family() == pdfv1::PDF_FAMILY_ATTACHMENTS &&
+            warning.message().find(name) != std::string::npos &&
+            warning.message().find(why) != std::string::npos) {
+          return true;
+        }
+      }
+      return false;
+    };
+    Check(warnings.size() == 2, "one warning for each damaged attachment");
+    Check(warned("garbage.bin", "/Size 5"),
+          "a stream that decodes short of its declared size is warned about");
+    Check(warned("lost.txt", "no readable embedded file stream"),
+          "an attachment without an embedded stream is warned about");
+  }
+  // When poppler's core API cannot open the bytes, ReadAttachments says so
+  // rather than reporting a document with no attachments; Parse turns that
+  // into a trailer warning.
+  {
+    int emitted = 0;
+    const grpc_poppler::AttachmentsRead read = grpc_poppler::ReadAttachments(
+        "%PDF-1.7\nnot a document\n", std::nullopt, std::nullopt,
+        [&emitted](pdfv1::AttachmentMeta&&, grpc_poppler::AttachmentData) {
+          ++emitted;
+          return true;
+        });
+    Check(read == grpc_poppler::AttachmentsRead::kDocumentUnreadable &&
+              emitted == 0,
+          "an unreadable document is reported, not listed as empty");
   }
   // Under a 4 KiB cap the attachment that inflates to 64 KiB is listed
   // without its data and the trailer says why; the others are unaffected.
   {
     std::map<std::string, pdfv1::AttachmentMeta> found;
     std::vector<pdfv1::ParseWarning> warnings;
-    Check(parse_attachments(*tight_stub, &found, &warnings),
+    Check(parse_attachments(*tight_stub, encodings, &found, &warnings),
           "capped attachments stream finishes OK");
     Check(found.count("zeros.bin") == 1 && !found["zeros.bin"].has_data(),
           "an attachment over the cap is listed without data");

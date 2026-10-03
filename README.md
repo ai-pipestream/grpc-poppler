@@ -113,6 +113,14 @@ contract has no typed verdict for one page once rasters have started). On
 its `/Count`, is left out of the inventory and the page chunks, and the
 trailer carries a `ParseWarning` with its `page_index`.
 
+An attachment whose data was asked for but cannot be had is still listed,
+and the trailer says why in a `ParseWarning`: its data passes the cap
+above, its file spec has no readable embedded stream, or the bytes it
+decodes to differ from its declared `/Params /Size` (poppler ends a stream
+it cannot decode as if at its end, so the mismatch is the one sign of
+damage). If poppler's core API cannot open the document at all, no
+attachment is listed and a warning says so.
+
 A set `PageRange` must have `end` greater than `begin`, the contract's one
 rule for it; anything else is `INVALID_ARGUMENT`. An `end` past the
 document stops at its last page, and a range that starts past it selects

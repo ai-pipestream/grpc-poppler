@@ -30,7 +30,9 @@ std::string TextString(const GooString* text) {
 }
 
 // Decodes an embedded file stream into *out. False, with *out cleared, once
-// the bytes pass max_bytes; reading stops there.
+// the bytes pass max_bytes; reading stops there. poppler's decoders report
+// a damaged stream only by ending it, so a true return does not prove the
+// bytes whole.
 bool ReadCapped(Stream* stream, uint64_t max_bytes, std::string* out) {
   unsigned char block[64 * 1024];
   for (;;) {
@@ -48,7 +50,7 @@ bool ReadCapped(Stream* stream, uint64_t max_bytes, std::string* out) {
 
 }  // namespace
 
-bool ReadAttachments(
+AttachmentsRead ReadAttachments(
     const std::string& data, const std::optional<std::string>& password,
     std::optional<uint64_t> max_data_bytes,
     const std::function<bool(pdfv1::AttachmentMeta&&, AttachmentData)>& emit) {
@@ -67,7 +69,7 @@ bool ReadAttachments(
                                          static_cast<Goffset>(data.size()),
                                          Object::null()),
              owner, user);
-  if (!doc.isOk()) return true;
+  if (!doc.isOk()) return AttachmentsRead::kDocumentUnreadable;
   Catalog* catalog = doc.getCatalog();
   const int files = catalog->numEmbeddedFiles();
   for (int i = 0; i < files; ++i) {
@@ -102,9 +104,9 @@ bool ReadAttachments(
         }
       }
     }
-    if (!emit(std::move(meta), outcome)) return false;
+    if (!emit(std::move(meta), outcome)) return AttachmentsRead::kStopped;
   }
-  return true;
+  return AttachmentsRead::kDone;
 }
 
 }  // namespace grpc_poppler

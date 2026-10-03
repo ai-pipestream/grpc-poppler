@@ -624,22 +624,62 @@ grpc::Status PopplerServiceImpl::Parse(
     if (request->options().include_attachment_data()) {
       max_data_bytes = limits_.max_attachment_bytes;
     }
-    client_ok = ReadAttachments(
+    const AttachmentsRead read = ReadAttachments(
         *resolved.bytes, DocumentPassword(request->document()), max_data_bytes,
         [&](pdfv1::AttachmentMeta&& meta, AttachmentData data) {
-          if (data == AttachmentData::kOverLimit) {
+          const auto warn = [&warnings](std::string message) {
             pdfv1::ParseWarning& warning = warnings.emplace_back();
             warning.set_family(pdfv1::PDF_FAMILY_ATTACHMENTS);
-            warning.set_message("attachment \"" + meta.name() +
-                                "\" decodes to more than " +
-                                std::to_string(limits_.max_attachment_bytes) +
-                                " bytes; its data is omitted");
+            warning.set_message(std::move(message));
+          };
+          const std::string quoted = "attachment \"" + meta.name() + "\"";
+          switch (data) {
+            case AttachmentData::kOverLimit:
+              warn(quoted + " decodes to more than " +
+                   std::to_string(limits_.max_attachment_bytes) +
+                   " bytes; its data is omitted");
+              break;
+            case AttachmentData::kUnavailable:
+              warn(quoted +
+                   " has no readable embedded file stream; its data is "
+                   "omitted");
+              break;
+            case AttachmentData::kIncluded:
+              // poppler ends a stream it cannot decode as if at its end, so
+              // a length that differs from the declared /Params /Size is the
+              // one sign of a damaged or misdeclared file.
+              if (meta.has_size_bytes() &&
+                  meta.data().size() != meta.size_bytes()) {
+                warn(quoted + " decodes to " +
+                     std::to_string(meta.data().size()) +
+                     " bytes but declares /Params /Size " +
+                     std::to_string(meta.size_bytes()) +
+                     "; its data may be damaged");
+              }
+              break;
+            case AttachmentData::kNotRequested:
+              break;
           }
           pdfv1::ParseResponse msg;
           *msg.mutable_attachment() = std::move(meta);
           ++counts[pdfv1::PDF_FAMILY_ATTACHMENTS];
           return WriteUngated(gate, writer, msg);
         });
+    switch (read) {
+      case AttachmentsRead::kDone:
+        break;
+      case AttachmentsRead::kStopped:
+        client_ok = false;
+        break;
+      case AttachmentsRead::kDocumentUnreadable: {
+        pdfv1::ParseWarning& warning = warnings.emplace_back();
+        warning.set_family(pdfv1::PDF_FAMILY_ATTACHMENTS);
+        warning.set_message(
+            "poppler's core API could not open the document; its embedded "
+            "files are not listed");
+        break;
+      }
+    }
   }
 
   // Font table from the document surface.
