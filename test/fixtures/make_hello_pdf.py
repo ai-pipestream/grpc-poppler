@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Regenerates hello.pdf: one Letter page, Helvetica 24pt "Hello PDF" at
 (100, 700). Kept as a generator so the fixture is reproducible; the checked
 in hello.pdf is the test input."""

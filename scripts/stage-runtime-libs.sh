@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Stages the shared-library closure of one or more binaries into a directory
 # so a glibc-only runtime image can load them from LD_LIBRARY_PATH alone: no
 # package manager, no ldconfig, nothing installed in the runtime stage.

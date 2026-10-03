@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1.27
+# SPDX-License-Identifier: GPL-3.0-or-later
 # GPL-3.0-or-later image: links Poppler. Off the default release path;
 # built only for the differential profile. This service is the
 # extraction-quality reference of the PDF backend fleet, so its poppler is
@@ -51,6 +52,9 @@ RUN curl -fsSL -o /tmp/poppler.tar.xz "https://poppler.freedesktop.org/poppler-$
       -DENABLE_UNSTABLE_API_ABI_HEADERS=ON \
  && cmake --build /tmp/poppler-build --parallel 4 \
  && cmake --install /tmp/poppler-build \
+ && mkdir -p /out/licenses/poppler \
+ && cp "/tmp/poppler-${POPPLER_VERSION}/COPYING" "/tmp/poppler-${POPPLER_VERSION}/COPYING3" \
+      /out/licenses/poppler/ \
  && rm -rf /tmp/poppler.tar.xz "/tmp/poppler-${POPPLER_VERSION}" /tmp/poppler-build
 
 WORKDIR /src
@@ -124,6 +128,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # without a passwd entry (65532 is the conventional nonroot uid in hardened
 # images).
 FROM ${GRPC_POPPLER_RUNTIME_IMAGE}
+# The image is GPL object code (the service and libpoppler), so the license
+# texts travel with it: this repository's GPL-3.0 and poppler's own COPYING
+# (GPL-2.0) and COPYING3 (GPL-3.0). The source label points at the
+# Corresponding Source: this repository, whose Dockerfile pins the poppler
+# tarball by URL and sha256.
+LABEL org.opencontainers.image.source="https://github.com/ai-pipestream/grpc-poppler" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
+COPY LICENSE /usr/share/doc/grpc-poppler/LICENSE
+COPY --from=build /out/licenses/poppler/ /usr/share/doc/poppler/
 COPY --from=build /out/lib/ /usr/local/lib/
 # Fontconfig's configuration, the Liberation and DejaVu fonts, and the
 # prebuilt font cache, as the one tree staged above: PDFs with embedded

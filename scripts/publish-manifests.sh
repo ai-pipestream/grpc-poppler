@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Turns the per-platform images a publish run pushed by digest into the
 # tagged manifest list the public name points at, then proves the result.
 #

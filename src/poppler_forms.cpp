@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "poppler_forms.h"
 
 #include <algorithm>
@@ -15,8 +17,9 @@
 #include <PDFDoc.h>
 #include <Page.h>
 #include <Stream.h>
-#include <UTF.h>
 #include <goo/GooString.h>
+
+#include "utf8.h"
 
 namespace grpc_poppler {
 
@@ -27,48 +30,22 @@ namespace {
 // ISO 32000-1 field flag bit 1 (table 221).
 constexpr uint32_t kFieldFlagReadOnly = 1u << 0;
 
-// A PDF text string (PDFDocEncoding, or UTF-16 behind a byte order mark)
-// as UTF-8. Decoded through TextStringToUCS4 rather than TextStringToUtf8,
-// which in this poppler keeps a trailing NUL inside the returned string and
-// narrows PDFDocEncoding code points above 0x7F to one byte.
-std::string TextStringUtf8(std::string_view text) {
-  std::string out;
-  for (const Unicode code : TextStringToUCS4(text)) {
-    if (code == 0) continue;
-    if (code < 0x80) {
-      out.push_back(static_cast<char>(code));
-    } else if (code < 0x800) {
-      out.push_back(static_cast<char>(0xC0 | (code >> 6)));
-      out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-    } else if (code < 0x10000) {
-      out.push_back(static_cast<char>(0xE0 | (code >> 12)));
-      out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-      out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-    } else if (code < 0x110000) {
-      out.push_back(static_cast<char>(0xF0 | (code >> 18)));
-      out.push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
-      out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
-      out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
-    }
-  }
-  return out;
-}
-
 std::string TextString(const GooString* text) {
   if (text == nullptr) return {};
-  return TextStringUtf8(text->toStr());
+  return PdfTextStringToUtf8(text->toStr());
 }
 
 // A field value as text: a text string decoded from PDFDocEncoding or
 // UTF-16, a name without its slash (the state name, as PDFium reports a
-// button value), the first entry of a multi-selection array.
+// button value, made valid UTF-8 since a PDF name is raw bytes), the first
+// entry of a multi-selection array.
 std::optional<std::string> ValueText(const Object& value) {
-  if (value.isString()) return TextStringUtf8(value.getString());
-  if (value.isName()) return std::string(value.getName());
+  if (value.isString()) return PdfTextStringToUtf8(value.getString());
+  if (value.isName()) return ValidUtf8(value.getName());
   if (value.isArray()) {
     for (int i = 0; i < value.arrayGetLength(); ++i) {
       const Object entry = value.arrayGet(i, 0);
-      if (entry.isString()) return TextStringUtf8(entry.getString());
+      if (entry.isString()) return PdfTextStringToUtf8(entry.getString());
     }
   }
   return std::nullopt;
@@ -99,7 +76,10 @@ pdfv1::FormFieldKind Kind(FormWidget* widget) {
   }
 }
 
-void FillField(FormWidget* widget, pdfv1::FormField* field) {
+// (cx, cy) is the CropBox's bottom-left corner: the rect is reported
+// relative to it, the contract's page space.
+void FillField(FormWidget* widget, double cx, double cy,
+               pdfv1::FormField* field) {
   field->set_kind(Kind(widget));
   field->set_name(TextString(widget->getFullyQualifiedName()));
 
@@ -123,7 +103,7 @@ void FillField(FormWidget* widget, pdfv1::FormField* field) {
   }
   const Object tooltip = Form::fieldLookup(dict, "TU");
   if (tooltip.isString()) {
-    std::string text = TextStringUtf8(tooltip.getString());
+    std::string text = PdfTextStringToUtf8(tooltip.getString());
     if (!text.empty()) field->set_alternate_name(std::move(text));
   }
   if (widget->getType() == formChoice) {
@@ -137,7 +117,7 @@ void FillField(FormWidget* widget, pdfv1::FormField* field) {
   // /AS belongs to the widget annotation and is never inherited.
   const Object state = object->dictLookup("AS");
   if (state.isName()) {
-    field->set_appearance_state(std::string("/") + state.getName());
+    field->set_appearance_state("/" + ValidUtf8(state.getName()));
   }
 
   double x1 = 0.0;
@@ -146,10 +126,10 @@ void FillField(FormWidget* widget, pdfv1::FormField* field) {
   double y2 = 0.0;
   widget->getRect(&x1, &y1, &x2, &y2);
   auto* rect = field->mutable_rect();
-  rect->set_x0(std::min(x1, x2));
-  rect->set_y0(std::min(y1, y2));
-  rect->set_x1(std::max(x1, x2));
-  rect->set_y1(std::max(y1, y2));
+  rect->set_x0(std::min(x1, x2) - cx);
+  rect->set_y0(std::min(y1, y2) - cy);
+  rect->set_x1(std::max(x1, x2) - cx);
+  rect->set_y1(std::max(y1, y2) - cy);
 }
 
 }  // namespace
@@ -180,10 +160,13 @@ std::map<int, std::vector<pdfv1::FormField>> ReadFormFields(
     if (page == nullptr) continue;
     std::unique_ptr<FormPageWidgets> widgets = page->getFormWidgets();
     if (widgets == nullptr) continue;
+    // Page::getCropBox is the box poppler-cpp's page_rect(crop_box) reads,
+    // so the shift matches PageInfo.crop_box.
+    const PDFRectangle& crop = page->getCropBox();
     for (int w = 0; w < widgets->getNumWidgets(); ++w) {
       FormWidget* widget = widgets->getWidget(w);
       if (widget == nullptr) continue;
-      FillField(widget, &out[index].emplace_back());
+      FillField(widget, crop.x1, crop.y1, &out[index].emplace_back());
     }
   }
   return out;

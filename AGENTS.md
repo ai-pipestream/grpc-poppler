@@ -22,6 +22,22 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   excluded from default release artifacts. It exists as the
   extraction-quality reference and the differential leg; keep its tier 0
   behaviour matching gRParse's in-process poppler path to the pixel.
+- **Geometry is in the contract's page space**: PDF user space before
+  /Rotate, origin bottom-left, shifted so the CropBox's bottom-left corner
+  is (0, 0); every `PageInfo` says so with `page_space =
+  PAGE_SPACE_CROP_BOX`, while `media_box` and `crop_box` stay as stored. The
+  widget rects subtract the CropBox origin in `src/poppler_forms.cpp`, and `rotation_degrees` is the real /Rotate. poppler-cpp's
+  `text_list()` measures boxes in the rotated display frame from the
+  CropBox's top-left corner; `TextFrame` (`src/poppler_service_impl.cpp`)
+  maps them back. Anything new that carries geometry lands in the same
+  space; `test/fixtures/frames.pdf` pins it for every /Rotate and for offset
+  CropBoxes.
+- **The arm64 gate** (`PopplerGate`, `src/poppler_service_impl.cpp`)
+  serializes poppler calls on arm64. A handler holds it while poppler code
+  runs and never across a network write: every stream write goes through
+  `WriteUngated`, so a slow or stalled client cannot hold every other
+  request behind it. Poppler objects are declared after the gate, so they
+  are destroyed with it held. Page loops stop when the call is cancelled.
 - **The content-addressed handshake** (`PdfDocument.sha256`) is served from
   an in-process LRU byte cache (`src/document_cache.h`), resolved once for
   all three RPCs in `ResolveDocumentBytes` (`src/poppler_service_impl.cpp`).
@@ -58,7 +74,8 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   too) and a prebuilt font cache. The build stage must stay on a glibc no
   newer than the runtime base's (2.41). `GRPC_POPPLER_RUNTIME_IMAGE`
   swaps the base. `scripts/smoke-test.sh IMAGE` is the boot gate (closure,
-  boot to listening under the hardened flags, uid).
+  boot to listening under the hardened flags, uid, license texts and the
+  source label).
 - **Publishing**: `.github/workflows/publish.yml` builds, smoke-tests, and
   only then pushes `docker.io/pipestreamai/grpc-poppler:latest` on every
   push to `main` and a `:<version>` tag via `workflow_dispatch`; auth is the

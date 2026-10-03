@@ -1,9 +1,16 @@
 # grpc-poppler
 
-**License: GPL-3.0-or-later.** This service links Poppler (GPL-2-or-later),
-so the combined work is GPL; the GPL dependency of the parsing fleet lives
-in this one container and nowhere else. It ships as an optional compose
-profile and is excluded from default release artifacts: it exists as the
+**License: GPL-3.0-or-later.** This service links Poppler, whose code
+inherited from xpdf is licensed under the GPL version 2 or version 3 only
+(Poppler's later code is GPL-2.0-or-later), and gRPC, protobuf and abseil
+under Apache-2.0, which combines with the GPL version 3 but not version 2;
+so the combined work is GPL-3.0. The image carries this repository's
+LICENSE and Poppler's COPYING and COPYING3 under `/usr/share/doc`, and its
+`org.opencontainers.image.source` label names this repository as the
+source. This is meant to be the parsing fleet's one GPL container; gRParse
+still links poppler-cpp in-process until its move to the backend contract
+(milestone M6) lands. It ships as an optional compose profile and is
+excluded from default release artifacts: it exists as the
 extraction-quality reference and the differential leg, not as part of the
 default stack.
 
@@ -11,18 +18,31 @@ Implements the fleet's common `PdfBackendService` contract
 (`ai.protomolt.parse.pdf.v1`, from the pinned parser-protos commit).
 The tier 0 floor mirrors the exact poppler-cpp usage of gRParse's
 in-process path: `load_from_raw_data`, `text_list(text_list_include_font)`
-word boxes, BGR24 rasters at a requested DPI, quarter-turn page geometry,
-and the arm64 serialization gate. On top of the floor, the cpp surface
+word boxes, BGR24 rasters at a requested DPI, page geometry, and the arm64
+serialization gate. `text_list` measures its word boxes in the frame
+poppler lays the page out in for display (the page's /Rotate applied,
+origin at the top-left corner of the CropBox); the service maps them back
+into the contract's page space, PDF user space before /Rotate shifted so
+the CropBox's bottom-left corner is (0, 0), the frame every geometry message
+(word boxes, quads, widget rects) uses and each `PageInfo` names with
+`page_space = PAGE_SPACE_CROP_BOX` (`media_box` and `crop_box` themselves
+stay as stored), starts each word's quad at its lower-left corner
+in its reading direction, and reports the page's real /Rotate (0, 90, 180
+or 270). On top of the floor, the cpp surface
 fills document metadata (info keys plus the XMP packet), permission bits
-for encrypted documents, the outline, embedded files, and the document
-font table. AcroForm widgets (form fields) come from poppler's core API,
-which the cpp wrapper does not expose: `src/poppler_forms.cpp` opens a
-core document over the same bytes and reports each widget with its
-inherited field type, /Ff flags and tooltip and the widget's own /AS
-appearance state. The poppler build installs the core headers for this
-(`ENABLE_UNSTABLE_API_ABI_HEADERS`); the library is the one poppler-cpp
-already links. Annotations and the structure tree are still reported
-unsupported, each with the reason; deep graphics resources are not
+for encrypted documents, the outline, and the document font table.
+AcroForm widgets (form fields) come from poppler's core API, which the cpp
+wrapper does not expose: `src/poppler_forms.cpp` opens a core document over
+the same bytes and reports each widget with its inherited field type, /Ff
+flags and tooltip and the widget's own /AS appearance state. Embedded files
+come from the core API too (`src/poppler_attachments.cpp`): the cpp wrapper
+cuts a UTF-16 file name at its first NUL byte and inflates a whole payload
+before handing it out, while the core file spec gives the raw name, decoded
+here as a PDF text string, and the stream, decoded block by block under a
+size cap (see Resource limits). The poppler build installs the core headers
+for this (`ENABLE_UNSTABLE_API_ABI_HEADERS`); the library is the one
+poppler-cpp already links. Annotations and the structure tree are still
+reported unsupported, each with the reason; deep graphics resources are not
 poppler's to give.
 
 ## Build and test
@@ -76,6 +96,39 @@ Setting either to `0` disables caching; a document larger than the byte
 ceiling is never stored. SHA-256 comes from the boringssl `crypto` target
 the gRPC build already compiles; there is no new dependency.
 
+## Resource limits
+
+One request cannot make the service decode without bound. The defaults
+(`ResourceLimits`, `src/poppler_service_impl.h`) also keep every message
+inside the server's 520 MiB message limit:
+
+| Bound | Default | Past it |
+|---|---|---|
+| Attachment data (`include_attachment_data`) | 256 MiB decoded, per attachment | the attachment is listed without `data`; the trailer carries a `ParseWarning` naming it |
+| Render `dpi` | 1200 | `INVALID_ARGUMENT`, as are zero, negative, NaN and infinite values |
+| Pixels per rendered page | 150 million (a 450 MB BGR raster) | `RESOURCE_EXHAUSTED`, checked from the page size before splash allocates |
+
+A page poppler cannot load or render ends the Render stream with
+`INTERNAL` naming the page, rather than being left out of the stream (the
+contract has no typed verdict for one page once rasters have started). On
+`Parse` a page it cannot load, as when a page tree holds fewer pages than
+its `/Count`, is left out of the inventory and the page chunks, and the
+trailer carries a `ParseWarning` with its `page_index`.
+
+An attachment whose data was asked for but cannot be had is still listed,
+and the trailer says why in a `ParseWarning`: its data passes the cap
+above, its file spec has no readable embedded stream, its stream's
+decoder will not start (a FlateDecode stream without a zlib header), or
+the bytes it decodes to differ from its declared `/Params /Size` (poppler
+ends a stream it stops decoding part way as if at its end, so the mismatch
+is the one sign of that damage). If poppler's core API cannot open the document at all, no
+attachment is listed and a warning says so.
+
+A set `PageRange` must have `end` greater than `begin`, the contract's one
+rule for it; anything else is `INVALID_ARGUMENT`. An `end` past the
+document stops at its last page, and a range that starts past it selects
+no page, however large its `begin`.
+
 ## Docker
 
 ```bash
@@ -110,8 +163,9 @@ image whose glibc is 2.41 or newer.
 `scripts/smoke-test.sh IMAGE` is the boot gate CI and the publish workflow
 run before any push: the library closure resolves inside the image (the
 dynamic loader reports it, since the base has no `ldd`), the server
-reaches its "listening on" line under `--read-only --cap-drop ALL`, and
-every process runs as uid 65532.
+reaches its "listening on" line under `--read-only --cap-drop ALL`,
+every process runs as uid 65532, and the license texts and the source
+label are in place.
 
 ## Compose profile
 
