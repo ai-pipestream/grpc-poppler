@@ -2,6 +2,7 @@
 // document families (metadata with XMP, outline, attachments, fonts) over
 // the hello.pdf and rich.pdf fixtures.
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -36,6 +37,22 @@ std::string ReadFile(const std::string& path) {
   return buf.str();
 }
 
+bool Near(double a, double b) { return std::abs(a - b) < 0.01; }
+
+bool SameBox(const pdfv1::BoundingBox& a, const pdfv1::BoundingBox& b) {
+  return Near(a.x0(), b.x0()) && Near(a.y0(), b.y0()) &&
+         Near(a.x1(), b.x1()) && Near(a.y1(), b.y1());
+}
+
+// The quad of text read left to right in page space: lower-left,
+// lower-right, upper-right, upper-left of its box.
+bool QuadReadsLeftToRight(const pdfv1::Quad& q, const pdfv1::BoundingBox& b) {
+  return Near(q.x0(), b.x0()) && Near(q.y0(), b.y0()) &&
+         Near(q.x1(), b.x1()) && Near(q.y1(), b.y0()) &&
+         Near(q.x2(), b.x1()) && Near(q.y2(), b.y1()) &&
+         Near(q.x3(), b.x0()) && Near(q.y3(), b.y1());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -46,7 +63,8 @@ int main(int argc, char** argv) {
   const std::string dir = argv[1];
   const std::string hello = ReadFile(dir + "/hello.pdf");
   const std::string rich = ReadFile(dir + "/rich.pdf");
-  Check(!hello.empty() && !rich.empty(), "fixtures read");
+  const std::string frames = ReadFile(dir + "/frames.pdf");
+  Check(!hello.empty() && !rich.empty() && !frames.empty(), "fixtures read");
 
   grpc_poppler::PopplerServiceImpl service;
   grpc::ServerBuilder builder;
@@ -180,6 +198,132 @@ int main(int argc, char** argv) {
       Check(box.appearance_state() == "/Yes", "/AS keeps the leading slash");
       Check(box.value() == "Yes", "button value is the state name");
       Check(box.alternate_name() == "I agree", "check box tooltip inherited");
+    }
+  }
+
+  // Page frames. frames.pdf draws one word with its baseline at (100, 700)
+  // in user space under every /Rotate and with offset CropBoxes
+  // (test/fixtures/make_frames_pdf.py). Geometry comes back in the
+  // contract's page space, user space before /Rotate with the CropBox
+  // origin included, so every page reports the upright page's box.
+  {
+    grpc::ClientContext ctx;
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(frames);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    std::vector<pdfv1::PageInfo> infos;
+    std::map<uint32_t, std::vector<pdfv1::TextCell>> cells;
+    std::map<uint32_t, std::vector<pdfv1::FormField>> fields;
+    while (reader->Read(&msg)) {
+      if (msg.has_header()) {
+        infos.assign(msg.header().pages().begin(), msg.header().pages().end());
+      } else if (msg.has_page()) {
+        const uint32_t index = msg.page().page_index();
+        for (const auto& cell : msg.page().text_cells()) {
+          cells[index].push_back(cell);
+        }
+        for (const auto& field : msg.page().form_fields()) {
+          fields[index].push_back(field);
+        }
+      }
+    }
+    Check(reader->Finish().ok(), "frames.pdf parses");
+    Check(infos.size() == 10, "frames.pdf inventories ten pages");
+
+    // rotation_degrees is the page's /Rotate (-90 is the same turn as
+    // 270); the size is the CropBox's, turned with the page; the boxes are
+    // reported as stored.
+    const int32_t rotations[10] = {0, 90, 180, 270, 270, 0, 90, 180, 270, 0};
+    for (size_t i = 0; i < infos.size() && i < 10; ++i) {
+      Check(infos[i].rotation_degrees() == rotations[i],
+            ("page " + std::to_string(i) + " reports its /Rotate").c_str());
+    }
+    if (infos.size() == 10) {
+      Check(Near(infos[1].width_pts(), 792) && Near(infos[1].height_pts(), 612),
+            "a quarter-turned page reports its turned size");
+      Check(Near(infos[2].width_pts(), 612) && Near(infos[2].height_pts(), 792),
+            "an upside-down page keeps its size");
+      const auto& crop = infos[5].crop_box();
+      Check(Near(crop.x0(), 36) && Near(crop.y0(), 36) &&
+                Near(crop.x1(), 576) && Near(crop.y1(), 756),
+            "the CropBox is reported as stored");
+      Check(Near(infos[5].width_pts(), 540) && Near(infos[5].height_pts(), 720),
+            "a cropped page reports the CropBox size");
+      Check(Near(infos[6].width_pts(), 740) && Near(infos[6].height_pts(), 510),
+            "a cropped, quarter-turned page reports the turned CropBox size");
+      Check(Near(infos[6].media_box().x1(), 612) &&
+                Near(infos[6].media_box().y1(), 792),
+            "the MediaBox is reported as stored");
+    }
+
+    auto word = [&cells](uint32_t page) -> const pdfv1::TextCell* {
+      for (const auto& cell : cells[page]) {
+        if (cell.text() == "Frame") return &cell;
+      }
+      return nullptr;
+    };
+    // Helvetica's metrics give the word's user-space box: its advance
+    // widths (F 611, r 333, a 556, m 833, e 556, 2.889 em) at 24 pt from
+    // x 100, and the font's descent (-207) and ascent (718) about the
+    // baseline at y 700.
+    const double word_length = 2.889 * 24;
+    const double descent = 0.207 * 24;
+    const double ascent = 0.718 * 24;
+    const pdfv1::TextCell* upright = word(0);
+    Check(upright != nullptr, "the upright page carries the word");
+    if (upright != nullptr) {
+      const auto& b = upright->bbox();
+      Check(Near(b.x0(), 100) && Near(b.y0(), 700 - descent) &&
+                Near(b.x1(), 100 + word_length) && Near(b.y1(), 700 + ascent),
+            "the upright word's box is its user-space box");
+      Check(QuadReadsLeftToRight(upright->quad(), b),
+            "the upright word's quad reads left to right");
+    }
+    for (uint32_t page = 1; page <= 8; ++page) {
+      const pdfv1::TextCell* cell = word(page);
+      const std::string name = "page " + std::to_string(page);
+      Check(cell != nullptr, (name + " carries the word").c_str());
+      if (cell == nullptr || upright == nullptr) continue;
+      Check(SameBox(cell->bbox(), upright->bbox()),
+            (name + " reports the upright page's box").c_str());
+      Check(QuadReadsLeftToRight(cell->quad(), cell->bbox()),
+            (name + " reports a quad that reads left to right").c_str());
+    }
+
+    // The widget rect is the stored /Rect, in the same space as the text:
+    // the word drawn inside the field lies inside its rect.
+    Check(fields[6].size() == 1, "the widget on the turned, cropped page");
+    const pdfv1::TextCell* boxed = word(6);
+    if (fields[6].size() == 1 && boxed != nullptr) {
+      const auto& r = fields[6][0].rect();
+      Check(Near(r.x0(), 90) && Near(r.y0(), 690) && Near(r.x1(), 260) &&
+                Near(r.y1(), 730),
+            "the widget rect is its /Rect");
+      const auto& b = boxed->bbox();
+      Check(b.x0() >= r.x0() && b.x1() <= r.x1() && b.y0() >= r.y0() &&
+                b.y1() <= r.y1(),
+            "the word lies inside the widget it was drawn in");
+    }
+
+    // A word turned a quarter counterclockwise reads up the page: its
+    // baseline starts at (300, 400) and its lower edge is on the right, so
+    // the quad starts at the box's lower-right corner and runs up.
+    const pdfv1::TextCell* upward = word(9);
+    Check(upward != nullptr, "the upward word is extracted");
+    if (upward != nullptr) {
+      const auto& b = upward->bbox();
+      const auto& q = upward->quad();
+      // Turned a quarter counterclockwise, the ascent reaches left of the
+      // baseline at x 300 and the descent right of it.
+      Check(Near(b.x0(), 300 - ascent) && Near(b.y0(), 400) &&
+                Near(b.x1(), 300 + descent) && Near(b.y1(), 400 + word_length),
+            "the upward word's box is its user-space box");
+      Check(Near(q.x0(), b.x1()) && Near(q.y0(), b.y0()) &&
+                Near(q.x1(), b.x1()) && Near(q.y1(), b.y1()) &&
+                Near(q.x2(), b.x0()) && Near(q.y2(), b.y1()) &&
+                Near(q.x3(), b.x0()) && Near(q.y3(), b.y0()),
+            "the upward word's quad follows its reading direction");
     }
   }
 

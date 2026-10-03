@@ -11,8 +11,15 @@ Implements the fleet's common `PdfBackendService` contract
 (`ai.protomolt.parse.pdf.v1`, from the pinned parser-protos commit).
 The tier 0 floor mirrors the exact poppler-cpp usage of gRParse's
 in-process path: `load_from_raw_data`, `text_list(text_list_include_font)`
-word boxes, BGR24 rasters at a requested DPI, quarter-turn page geometry,
-and the arm64 serialization gate. On top of the floor, the cpp surface
+word boxes, BGR24 rasters at a requested DPI, page geometry, and the arm64
+serialization gate. `text_list` measures its word boxes in the frame
+poppler lays the page out in for display (the page's /Rotate applied,
+origin at the top-left corner of the CropBox); the service maps them back
+into the contract's page space, PDF user space before /Rotate with the
+CropBox origin included (the space of `PageInfo.crop_box`, the widget rects
+and grpc-pdfium's boxes), starts each word's quad at its lower-left corner
+in its reading direction, and reports the page's real /Rotate (0, 90, 180
+or 270). On top of the floor, the cpp surface
 fills document metadata (info keys plus the XMP packet), permission bits
 for encrypted documents, the outline, embedded files, and the document
 font table. AcroForm widgets (form fields) come from poppler's core API,

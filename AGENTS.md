@@ -22,6 +22,15 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   excluded from default release artifacts. It exists as the
   extraction-quality reference and the differential leg; keep its tier 0
   behaviour matching gRParse's in-process poppler path to the pixel.
+- **Geometry is in the contract's page space**: PDF user space before
+  /Rotate, origin bottom-left, with the CropBox origin included (the space
+  `PageInfo.crop_box` and the widget rects are reported in, and the one
+  grpc-pdfium uses), and `rotation_degrees` is the real /Rotate. poppler-cpp's
+  `text_list()` measures boxes in the rotated display frame from the
+  CropBox's top-left corner; `TextFrame` (`src/poppler_service_impl.cpp`)
+  maps them back. Anything new that carries geometry lands in the same
+  space; `test/fixtures/frames.pdf` pins it for every /Rotate and for offset
+  CropBoxes.
 - **The content-addressed handshake** (`PdfDocument.sha256`) is served from
   an in-process LRU byte cache (`src/document_cache.h`), resolved once for
   all three RPCs in `ResolveDocumentBytes` (`src/poppler_service_impl.cpp`).

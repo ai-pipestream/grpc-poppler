@@ -1,6 +1,7 @@
 #include "poppler_service_impl.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -253,6 +254,113 @@ bool IsQuarterTurn(const poppler::page& page) {
          orientation == poppler::page::seascape;
 }
 
+// The page's /Rotate as the contract reports it: 0, 90, 180 or 270 degrees
+// clockwise. page::orientation() reads the /Rotate value poppler folded
+// into [0, 360); poppler draws any other value upright, so it reports 0.
+int RotationDegrees(const poppler::page& page) {
+  switch (page.orientation()) {
+    case poppler::page::landscape:
+      return 90;
+    case poppler::page::upside_down:
+      return 180;
+    case poppler::page::seascape:
+      return 270;
+    default:
+      return 0;
+  }
+}
+
+// Maps poppler-cpp's text_list() boxes into the contract's page space.
+//
+// text_list() lays the page out the way a viewer shows it: 72 DPI, the
+// page's /Rotate applied (Page::createGfx adds getRotate() to the rotation
+// it is asked for), the CropBox as the device box, origin top-left
+// (GfxState's CTM for an upside-down output device). A user-space point
+// (x, y) on a page whose CropBox is [cx1 cy1 cx2 cy2] lands at
+//
+//   /Rotate   device u   device v
+//   0         x - cx1    cy2 - y
+//   90        y - cy1    x - cx1
+//   180       cx2 - x    y - cy1
+//   270       cy2 - y    cx2 - x
+//
+// The contract's page space is PDF user space before /Rotate, origin
+// bottom-left, and absolute: the CropBox origin is part of each coordinate,
+// as in PageInfo.crop_box, the widget rects, and grpc-pdfium's boxes.
+// TextFrame inverts the table.
+class TextFrame {
+ public:
+  explicit TextFrame(const poppler::page& page)
+      : rotation_(RotationDegrees(page)),
+        crop_(page.page_rect(poppler::crop_box)) {}
+
+  // Sets the box and the quad of one text_list() box. The quad starts at
+  // the word's lower-left corner in its own reading frame. text_box's
+  // rotation() is the quarter turn of the word's baseline in the device
+  // frame (0 reads left to right, 1 down the page, 2 right to left upside
+  // down, 3 up the page), which says which device edge is the word's
+  // lower edge and where its reading starts.
+  void Place(const poppler::text_box& box, pdfv1::BoundingBox* bbox,
+             pdfv1::Quad* quad) const {
+    // The device box; v grows downward, so rectf's top() is the smaller v.
+    const poppler::rectf device = box.bbox();
+    const double u0 = device.left();
+    const double v0 = device.top();
+    const double u1 = device.right();
+    const double v1 = device.bottom();
+    // Lower-left, lower-right, upper-right, upper-left, in device space.
+    std::array<std::array<double, 2>, 4> corners;
+    switch (box.rotation()) {
+      case 1:
+        corners = {{{u0, v0}, {u0, v1}, {u1, v1}, {u1, v0}}};
+        break;
+      case 2:
+        corners = {{{u1, v0}, {u0, v0}, {u0, v1}, {u1, v1}}};
+        break;
+      case 3:
+        corners = {{{u1, v1}, {u1, v0}, {u0, v0}, {u0, v1}}};
+        break;
+      default:
+        corners = {{{u0, v1}, {u1, v1}, {u1, v0}, {u0, v0}}};
+        break;
+    }
+    for (auto& corner : corners) corner = ToPage(corner[0], corner[1]);
+    quad->set_x0(corners[0][0]);
+    quad->set_y0(corners[0][1]);
+    quad->set_x1(corners[1][0]);
+    quad->set_y1(corners[1][1]);
+    quad->set_x2(corners[2][0]);
+    quad->set_y2(corners[2][1]);
+    quad->set_x3(corners[3][0]);
+    quad->set_y3(corners[3][1]);
+    // The lower-left and upper-right corners are opposite corners of the
+    // axis-aligned box.
+    bbox->set_x0(std::min(corners[0][0], corners[2][0]));
+    bbox->set_y0(std::min(corners[0][1], corners[2][1]));
+    bbox->set_x1(std::max(corners[0][0], corners[2][0]));
+    bbox->set_y1(std::max(corners[0][1], corners[2][1]));
+  }
+
+ private:
+  // A device point in contract page space. The CropBox's left(), top(),
+  // right() and bottom() are its x1, y1, x2 and y2.
+  std::array<double, 2> ToPage(double u, double v) const {
+    switch (rotation_) {
+      case 90:
+        return {crop_.left() + v, crop_.top() + u};
+      case 180:
+        return {crop_.right() - u, crop_.top() + v};
+      case 270:
+        return {crop_.right() - v, crop_.bottom() - u};
+      default:
+        return {crop_.left() + u, crop_.bottom() - v};
+    }
+  }
+
+  int rotation_;
+  poppler::rectf crop_;
+};
+
 // Assigns stable ids to font names within one stream.
 class FontInterner {
  public:
@@ -363,9 +471,7 @@ grpc::Status PopplerServiceImpl::Parse(
     const auto rect = page->page_rect();
     info->set_width_pts(quarter_turn ? rect.height() : rect.width());
     info->set_height_pts(quarter_turn ? rect.width() : rect.height());
-    // The cpp wrapper reports orientation, not the /Rotate value; a
-    // quarter turn is reported as 90 by convention here.
-    info->set_rotation_degrees(quarter_turn ? 90 : 0);
+    info->set_rotation_degrees(RotationDegrees(*page));
     auto* media = info->mutable_media_box();
     const auto media_rect = page->page_rect(poppler::media_box);
     media->set_x0(media_rect.left());
@@ -512,32 +618,13 @@ grpc::Status PopplerServiceImpl::Parse(
     auto* chunk = page_msg.mutable_page();
     chunk->set_page_index(static_cast<uint32_t>(i));
     if (want_text) {
-      const bool quarter_turn = IsQuarterTurn(*page);
-      const auto rect = page->page_rect();
-      const double page_height =
-          quarter_turn ? rect.width() : rect.height();
+      const TextFrame frame(*page);
       const auto boxes =
           page->text_list(poppler::page::text_list_include_font);
       for (const auto& box : boxes) {
-        const auto b = box.bbox();
         auto* cell = chunk->add_text_cells();
         cell->set_text(ToUtf8(box.text()));
-        // poppler reports top-left-origin boxes; the contract wants the
-        // PDF bottom-left convention.
-        auto* bbox = cell->mutable_bbox();
-        bbox->set_x0(b.x());
-        bbox->set_y0(page_height - (b.y() + b.height()));
-        bbox->set_x1(b.x() + b.width());
-        bbox->set_y1(page_height - b.y());
-        auto* quad = cell->mutable_quad();
-        quad->set_x0(bbox->x0());
-        quad->set_y0(bbox->y0());
-        quad->set_x1(bbox->x1());
-        quad->set_y1(bbox->y0());
-        quad->set_x2(bbox->x1());
-        quad->set_y2(bbox->y1());
-        quad->set_x3(bbox->x0());
-        quad->set_y3(bbox->y1());
+        frame.Place(box, cell->mutable_bbox(), cell->mutable_quad());
         if (box.has_font_info()) {
           cell->set_font_size(box.get_font_size());
           const std::string name = box.get_font_name();
