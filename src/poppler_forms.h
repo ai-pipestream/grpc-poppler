@@ -13,6 +13,8 @@ namespace grpc_poppler {
 
 // The AcroForm widgets of pages [begin, end), keyed by zero-based page
 // index, one FormField per widget annotation in the page's /Annots order.
+// Each rect is the widget's /Rect relative to the page's CropBox, the
+// contract's page space.
 //
 // poppler-cpp has no forms surface, so this reads poppler's core API (the
 // Form, FormWidget and Object classes of libpoppler, which poppler-cpp

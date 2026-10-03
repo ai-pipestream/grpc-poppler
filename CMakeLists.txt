@@ -57,13 +57,13 @@ FetchContent_MakeAvailable(grpc)
 # GitHub-hosted runners cannot resolve the Forgejo host, and the per-file
 # sha256 pins below verify the bytes either way.
 # ---------------------------------------------------------------------------
-set(PDF_PROTOS_COMMIT "ba226130c49683a8e629a6d3dc0f58c83c51c628"
+set(PDF_PROTOS_COMMIT "56e78a9186607847828fc3ef95f06daab2cc7209"
     CACHE STRING "parser-protos commit the contract comes from")
 set(PDF_PROTOS_BASE_URL
     "https://raw.githubusercontent.com/ai-pipestream/parser-protos/${PDF_PROTOS_COMMIT}/proto/ai/protomolt/parse/pdf/v1"
     CACHE STRING "base URL the contract proto files are downloaded from")
 set(PDF_PROTO_TYPES_SHA256
-    "27c9d9e4f822650344e609a1ca4ca79e7d7f2d867c0517f72bfa6982af8e8edd"
+    "c8a556c4f978c22f918d9dcbdb765951f591f6598cd59edef83bc75e855b2d44"
     CACHE STRING "sha256 of pdf_backend_types.proto")
 set(PDF_PROTO_SERVICE_SHA256
     "f0d47132b48af9cf09007afac32b26ef8f8e521b16f7bc105780d6afef5e4e8a"

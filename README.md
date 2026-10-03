@@ -22,9 +22,11 @@ word boxes, BGR24 rasters at a requested DPI, page geometry, and the arm64
 serialization gate. `text_list` measures its word boxes in the frame
 poppler lays the page out in for display (the page's /Rotate applied,
 origin at the top-left corner of the CropBox); the service maps them back
-into the contract's page space, PDF user space before /Rotate with the
-CropBox origin included (the space of `PageInfo.crop_box`, the widget rects
-and grpc-pdfium's boxes), starts each word's quad at its lower-left corner
+into the contract's page space, PDF user space before /Rotate shifted so
+the CropBox's bottom-left corner is (0, 0), the frame every geometry message
+(word boxes, quads, widget rects) uses and each `PageInfo` names with
+`page_space = PAGE_SPACE_CROP_BOX` (`media_box` and `crop_box` themselves
+stay as stored), starts each word's quad at its lower-left corner
 in its reading direction, and reports the page's real /Rotate (0, 90, 180
 or 270). On top of the floor, the cpp surface
 fills document metadata (info keys plus the XMP packet), permission bits

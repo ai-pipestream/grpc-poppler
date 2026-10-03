@@ -76,7 +76,10 @@ pdfv1::FormFieldKind Kind(FormWidget* widget) {
   }
 }
 
-void FillField(FormWidget* widget, pdfv1::FormField* field) {
+// (cx, cy) is the CropBox's bottom-left corner: the rect is reported
+// relative to it, the contract's page space.
+void FillField(FormWidget* widget, double cx, double cy,
+               pdfv1::FormField* field) {
   field->set_kind(Kind(widget));
   field->set_name(TextString(widget->getFullyQualifiedName()));
 
@@ -123,10 +126,10 @@ void FillField(FormWidget* widget, pdfv1::FormField* field) {
   double y2 = 0.0;
   widget->getRect(&x1, &y1, &x2, &y2);
   auto* rect = field->mutable_rect();
-  rect->set_x0(std::min(x1, x2));
-  rect->set_y0(std::min(y1, y2));
-  rect->set_x1(std::max(x1, x2));
-  rect->set_y1(std::max(y1, y2));
+  rect->set_x0(std::min(x1, x2) - cx);
+  rect->set_y0(std::min(y1, y2) - cy);
+  rect->set_x1(std::max(x1, x2) - cx);
+  rect->set_y1(std::max(y1, y2) - cy);
 }
 
 }  // namespace
@@ -157,10 +160,13 @@ std::map<int, std::vector<pdfv1::FormField>> ReadFormFields(
     if (page == nullptr) continue;
     std::unique_ptr<FormPageWidgets> widgets = page->getFormWidgets();
     if (widgets == nullptr) continue;
+    // Page::getCropBox is the box poppler-cpp's page_rect(crop_box) reads,
+    // so the shift matches PageInfo.crop_box.
+    const PDFRectangle& crop = page->getCropBox();
     for (int w = 0; w < widgets->getNumWidgets(); ++w) {
       FormWidget* widget = widgets->getWidget(w);
       if (widget == nullptr) continue;
-      FillField(widget, &out[index].emplace_back());
+      FillField(widget, crop.x1, crop.y1, &out[index].emplace_back());
     }
   }
   return out;

@@ -23,9 +23,10 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   extraction-quality reference and the differential leg; keep its tier 0
   behaviour matching gRParse's in-process poppler path to the pixel.
 - **Geometry is in the contract's page space**: PDF user space before
-  /Rotate, origin bottom-left, with the CropBox origin included (the space
-  `PageInfo.crop_box` and the widget rects are reported in, and the one
-  grpc-pdfium uses), and `rotation_degrees` is the real /Rotate. poppler-cpp's
+  /Rotate, origin bottom-left, shifted so the CropBox's bottom-left corner
+  is (0, 0); every `PageInfo` says so with `page_space =
+  PAGE_SPACE_CROP_BOX`, while `media_box` and `crop_box` stay as stored. The
+  widget rects subtract the CropBox origin in `src/poppler_forms.cpp`, and `rotation_degrees` is the real /Rotate. poppler-cpp's
   `text_list()` measures boxes in the rotated display frame from the
   CropBox's top-left corner; `TextFrame` (`src/poppler_service_impl.cpp`)
   maps them back. Anything new that carries geometry lands in the same

@@ -4,8 +4,8 @@
 draw the same Helvetica 24pt word "Frame" with its baseline at (100, 700)
 in PDF user space, under every /Rotate value and with offset CropBoxes, so
 a backend that reports geometry in the contract's frame (user space before
-/Rotate, CropBox origin included) gives every page the same box as the
-upright page 0.
+/Rotate, shifted so the CropBox's bottom-left corner is (0, 0)) gives every
+page the upright page 0's box less that page's CropBox origin.
 
   page 0  /Rotate 0
   page 1  /Rotate 90

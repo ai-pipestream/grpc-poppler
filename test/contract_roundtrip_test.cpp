@@ -61,11 +61,6 @@ void SetDeadline(grpc::ClientContext* ctx) {
 
 bool Near(double a, double b) { return std::abs(a - b) < 0.01; }
 
-bool SameBox(const pdfv1::BoundingBox& a, const pdfv1::BoundingBox& b) {
-  return Near(a.x0(), b.x0()) && Near(a.y0(), b.y0()) &&
-         Near(a.x1(), b.x1()) && Near(a.y1(), b.y1());
-}
-
 // The quad of text read left to right in page space: lower-left,
 // lower-right, upper-right, upper-left of its box.
 bool QuadReadsLeftToRight(const pdfv1::Quad& q, const pdfv1::BoundingBox& b) {
@@ -513,8 +508,9 @@ int main(int argc, char** argv) {
   // Page frames. frames.pdf draws one word with its baseline at (100, 700)
   // in user space under every /Rotate and with offset CropBoxes
   // (test/fixtures/make_frames_pdf.py). Geometry comes back in the
-  // contract's page space, user space before /Rotate with the CropBox
-  // origin included, so every page reports the upright page's box.
+  // contract's page space, user space before /Rotate shifted so the
+  // CropBox's bottom-left corner is (0, 0): every page reports the upright
+  // page's box less its CropBox origin, and says so in page_space.
   {
     grpc::ClientContext ctx;
     SetDeadline(&ctx);
@@ -548,6 +544,10 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < infos.size() && i < 10; ++i) {
       Check(infos[i].rotation_degrees() == rotations[i],
             ("page " + std::to_string(i) + " reports its /Rotate").c_str());
+      Check(infos[i].page_space() == pdfv1::PAGE_SPACE_CROP_BOX,
+            ("page " + std::to_string(i) +
+             " says its geometry is relative to the CropBox")
+                .c_str());
     }
     if (infos.size() == 10) {
       Check(Near(infos[1].width_pts(), 792) && Near(infos[1].height_pts(), 612),
@@ -590,26 +590,39 @@ int main(int argc, char** argv) {
       Check(QuadReadsLeftToRight(upright->quad(), b),
             "the upright word's quad reads left to right");
     }
+    // The CropBox origin of each page: pages 0 to 4 are uncropped, page 5
+    // is cropped to [36 36 576 756], and pages 6 to 8 (turned 90, 180 and
+    // 270) to [50 20 560 760].
+    const double crop_origin[9][2] = {{0, 0},   {0, 0},   {0, 0},
+                                      {0, 0},   {0, 0},   {36, 36},
+                                      {50, 20}, {50, 20}, {50, 20}};
     for (uint32_t page = 1; page <= 8; ++page) {
       const pdfv1::TextCell* cell = word(page);
       const std::string name = "page " + std::to_string(page);
       Check(cell != nullptr, (name + " carries the word").c_str());
       if (cell == nullptr || upright == nullptr) continue;
-      Check(SameBox(cell->bbox(), upright->bbox()),
-            (name + " reports the upright page's box").c_str());
+      const double cx = crop_origin[page][0];
+      const double cy = crop_origin[page][1];
+      const auto& u = upright->bbox();
+      const auto& b = cell->bbox();
+      Check(Near(b.x0(), u.x0() - cx) && Near(b.y0(), u.y0() - cy) &&
+                Near(b.x1(), u.x1() - cx) && Near(b.y1(), u.y1() - cy),
+            (name + " reports the upright page's box, CropBox-relative")
+                .c_str());
       Check(QuadReadsLeftToRight(cell->quad(), cell->bbox()),
             (name + " reports a quad that reads left to right").c_str());
     }
 
-    // The widget rect is the stored /Rect, in the same space as the text:
-    // the word drawn inside the field lies inside its rect.
+    // The widget rect is the stored /Rect less the CropBox origin (50, 20),
+    // in the same space as the text: the word drawn inside the field lies
+    // inside its rect.
     Check(fields[6].size() == 1, "the widget on the turned, cropped page");
     const pdfv1::TextCell* boxed = word(6);
     if (fields[6].size() == 1 && boxed != nullptr) {
       const auto& r = fields[6][0].rect();
-      Check(Near(r.x0(), 90) && Near(r.y0(), 690) && Near(r.x1(), 260) &&
-                Near(r.y1(), 730),
-            "the widget rect is its /Rect");
+      Check(Near(r.x0(), 40) && Near(r.y0(), 670) && Near(r.x1(), 210) &&
+                Near(r.y1(), 710),
+            "the widget rect is its /Rect relative to the CropBox");
       const auto& b = boxed->bbox();
       Check(b.x0() >= r.x0() && b.x1() <= r.x1() && b.y0() >= r.y0() &&
                 b.y1() <= r.y1(),

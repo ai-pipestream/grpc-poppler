@@ -320,9 +320,9 @@ int RotationDegrees(const poppler::page& page) {
 //   270       cy2 - y    cx2 - x
 //
 // The contract's page space is PDF user space before /Rotate, origin
-// bottom-left, and absolute: the CropBox origin is part of each coordinate,
-// as in PageInfo.crop_box, the widget rects, and grpc-pdfium's boxes.
-// TextFrame inverts the table.
+// bottom-left, shifted so the CropBox's bottom-left corner is (0, 0)
+// (PageInfo.page_space = PAGE_SPACE_CROP_BOX). TextFrame inverts the table
+// and subtracts (cx1, cy1).
 class TextFrame {
  public:
   explicit TextFrame(const poppler::page& page)
@@ -377,18 +377,21 @@ class TextFrame {
   }
 
  private:
-  // A device point in contract page space. The CropBox's left(), top(),
-  // right() and bottom() are its x1, y1, x2 and y2.
+  // A device point in contract page space, relative to the CropBox: the
+  // table above less (cx1, cy1), with w and h the CropBox's width and
+  // height before /Rotate.
   std::array<double, 2> ToPage(double u, double v) const {
+    const double w = crop_.width();
+    const double h = crop_.height();
     switch (rotation_) {
       case 90:
-        return {crop_.left() + v, crop_.top() + u};
+        return {v, u};
       case 180:
-        return {crop_.right() - u, crop_.top() + v};
+        return {w - u, v};
       case 270:
-        return {crop_.right() - v, crop_.bottom() - u};
+        return {w - v, h - u};
       default:
-        return {crop_.left() + u, crop_.bottom() - v};
+        return {u, h - v};
     }
   }
 
@@ -527,6 +530,7 @@ grpc::Status PopplerServiceImpl::Parse(
     crop->set_y0(crop_rect.top());
     crop->set_x1(crop_rect.right());
     crop->set_y1(crop_rect.bottom());
+    info->set_page_space(pdfv1::PAGE_SPACE_CROP_BOX);
   }
   if (!WriteUngated(gate, writer, header_msg) ||
       loaded.status != pdfv1::LOAD_STATUS_OK) {
