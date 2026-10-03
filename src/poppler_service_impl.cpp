@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -175,6 +176,13 @@ std::optional<std::string> DocumentPassword(
     const pdfv1::PdfDocument& document) {
   if (!document.has_password()) return std::nullopt;
   return document.password();
+}
+
+// A number for an error message: 1200 rather than 1200.000000.
+std::string FormatNumber(double value) {
+  std::ostringstream out;
+  out << value;
+  return out.str();
 }
 
 // The one engine identity string, shared by Probe capabilities and
@@ -691,9 +699,19 @@ grpc::Status PopplerServiceImpl::Parse(
 grpc::Status PopplerServiceImpl::Render(
     grpc::ServerContext* /*context*/, const pdfv1::RenderRequest* request,
     grpc::ServerWriter<pdfv1::RenderResponse>* writer) {
-  if (request->dpi() <= 0.0) {
+  // dpi sizes the raster splash allocates, so NaN and infinity are refused
+  // along with zero and negative values, and so is a dpi above the cap;
+  // the per-page pixel cap below bounds what remains.
+  const double dpi = request->dpi();
+  if (!std::isfinite(dpi) || dpi <= 0.0) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                        "dpi must be positive");
+                        "dpi must be a positive number");
+  }
+  if (dpi > limits_.max_render_dpi) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                        "dpi " + FormatNumber(dpi) +
+                            " is above the maximum of " +
+                            FormatNumber(limits_.max_render_dpi));
   }
   if (request->has_pages()) {
     if (grpc::Status range = CheckPageRange(request->pages()); !range.ok()) {
@@ -731,9 +749,25 @@ grpc::Status PopplerServiceImpl::Render(
   for (int i = begin; i < end; ++i) {
     std::unique_ptr<poppler::page> page(loaded.doc->create_page(i));
     if (page == nullptr) continue;
-    const poppler::image image =
-        renderer.render_page(page.get(), request->dpi(), request->dpi());
-    if (!image.is_valid()) continue;
+    // The raster's size is known before splash allocates it: the CropBox
+    // at the requested dpi (rounded up here; splash rounds to nearest).
+    const poppler::rectf box = page->page_rect();
+    const double scale = dpi / 72.0;
+    const double pixels =
+        std::ceil(box.width() * scale) * std::ceil(box.height() * scale);
+    if (pixels > static_cast<double>(limits_.max_raster_pixels)) {
+      return grpc::Status(
+          grpc::StatusCode::RESOURCE_EXHAUSTED,
+          "page " + std::to_string(i) + " at " + FormatNumber(dpi) +
+              " dpi would be " + FormatNumber(pixels) +
+              " pixels, above the limit of " +
+              std::to_string(limits_.max_raster_pixels));
+    }
+    const poppler::image image = renderer.render_page(page.get(), dpi, dpi);
+    if (!image.is_valid()) {
+      return grpc::Status(grpc::StatusCode::INTERNAL,
+                          "poppler could not render page " + std::to_string(i));
+    }
     pdfv1::RenderResponse msg;
     auto* raster = msg.mutable_raster();
     raster->set_page_index(static_cast<uint32_t>(i));
@@ -741,7 +775,7 @@ grpc::Status PopplerServiceImpl::Render(
     raster->set_height_px(static_cast<uint32_t>(image.height()));
     raster->set_stride_bytes(static_cast<uint32_t>(image.bytes_per_row()));
     raster->set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
-    raster->set_dpi(request->dpi());
+    raster->set_dpi(dpi);
     raster->set_pixels(image.const_data(),
                        static_cast<size_t>(image.bytes_per_row()) *
                            image.height());

@@ -96,6 +96,11 @@ inside the server's 520 MiB message limit:
 | Bound | Default | Past it |
 |---|---|---|
 | Attachment data (`include_attachment_data`) | 256 MiB decoded, per attachment | the attachment is listed without `data`; the trailer carries a `ParseWarning` naming it |
+| Render `dpi` | 1200 | `INVALID_ARGUMENT`, as are zero, negative, NaN and infinite values |
+| Pixels per rendered page | 150 million (a 450 MB BGR raster) | `RESOURCE_EXHAUSTED`, checked from the page size before splash allocates |
+
+A page poppler cannot render ends the Render stream with `INTERNAL` naming
+the page, rather than being left out of the stream.
 
 A set `PageRange` must have `end` greater than `begin` and a `begin` below
 2^31 (poppler indexes pages with an int); anything else is

@@ -16,6 +16,12 @@ struct ResourceLimits {
   // Most bytes one attachment may decode to. A larger attachment is sent
   // without its data, and the trailer carries a ParseWarning.
   uint64_t max_attachment_bytes = 256ull * 1024 * 1024;
+  // Highest Render dpi accepted; a higher one is INVALID_ARGUMENT.
+  double max_render_dpi = 1200.0;
+  // Most pixels one rendered page may have. A page past it fails the
+  // Render with RESOURCE_EXHAUSTED before splash allocates anything; at
+  // three bytes a pixel the default is a 450 MB raster.
+  uint64_t max_raster_pixels = 150'000'000;
 };
 
 // PdfBackendService over poppler-cpp: the extraction-quality reference and

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -94,6 +95,8 @@ int main(int argc, char** argv) {
   // fixtures.
   grpc_poppler::ResourceLimits tight_limits;
   tight_limits.max_attachment_bytes = 4096;
+  tight_limits.max_render_dpi = 150;
+  tight_limits.max_raster_pixels = 612 * 792;  // hello.pdf at 72 dpi
   grpc_poppler::PopplerServiceImpl tight_service({8, 1u << 30}, tight_limits);
   grpc::ServerBuilder tight_builder;
   int tight_port = 0;
@@ -486,6 +489,56 @@ int main(int argc, char** argv) {
     }
     Check(has_ink, "raster has non-white pixels");
     Check(reader->Finish().ok(), "render finished OK");
+  }
+
+  // Render bounds. dpi must be a finite positive number no higher than the
+  // service's maximum (1200 by default), and a page whose raster would
+  // pass the pixel limit is refused with RESOURCE_EXHAUSTED before splash
+  // allocates it. The tight service allows 150 dpi and exactly the pixels
+  // of hello.pdf at 72 dpi.
+  auto render_hello = [&hello](pdfv1::PdfBackendService::Stub& client,
+                               double dpi, size_t* rasters) {
+    grpc::ClientContext ctx;
+    SetDeadline(&ctx);
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_data(hello);
+    request.set_dpi(dpi);
+    request.set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
+    auto reader = client.Render(&ctx, request);
+    pdfv1::RenderResponse msg;
+    *rasters = 0;
+    while (reader->Read(&msg)) {
+      if (msg.has_raster()) ++*rasters;
+    }
+    return reader->Finish().error_code();
+  };
+  for (const double dpi : {0.0, -72.0, std::nan(""),
+                           std::numeric_limits<double>::infinity(),
+                           -std::numeric_limits<double>::infinity(), 1200.5,
+                           1e9}) {
+    size_t rasters = 0;
+    Check(render_hello(*stub, dpi, &rasters) ==
+                  grpc::StatusCode::INVALID_ARGUMENT &&
+              rasters == 0,
+          ("dpi " + std::to_string(dpi) + " is INVALID_ARGUMENT").c_str());
+  }
+  {
+    size_t rasters = 0;
+    Check(render_hello(*tight_stub, 72.0, &rasters) == grpc::StatusCode::OK &&
+              rasters == 1,
+          "a raster exactly at the pixel limit renders");
+    Check(render_hello(*tight_stub, 73.0, &rasters) ==
+                  grpc::StatusCode::RESOURCE_EXHAUSTED &&
+              rasters == 0,
+          "a raster past the pixel limit is RESOURCE_EXHAUSTED");
+    Check(render_hello(*tight_stub, 150.0, &rasters) ==
+                  grpc::StatusCode::RESOURCE_EXHAUSTED &&
+              rasters == 0,
+          "the dpi maximum itself still meets the pixel limit");
+    Check(render_hello(*tight_stub, 150.5, &rasters) ==
+                  grpc::StatusCode::INVALID_ARGUMENT &&
+              rasters == 0,
+          "a dpi above the service's maximum is INVALID_ARGUMENT");
   }
 
   // PageRange is zero-based and half-open. A set range needs end greater
