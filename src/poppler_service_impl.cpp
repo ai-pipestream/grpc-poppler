@@ -10,10 +10,10 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <poppler/cpp/poppler-document.h>
-#include <poppler/cpp/poppler-embedded-file.h>
 #include <poppler/cpp/poppler-font.h>
 #include <poppler/cpp/poppler-image.h>
 #include <poppler/cpp/poppler-page-renderer.h>
@@ -22,6 +22,7 @@
 #include <poppler/cpp/poppler-version.h>
 
 #include "document_cache.h"
+#include "poppler_attachments.h"
 #include "poppler_forms.h"
 #include "sha256.h"
 
@@ -165,6 +166,14 @@ void LoadDocument(const std::string& data, const pdfv1::PdfDocument& request,
     return;
   }
   out->status = pdfv1::LOAD_STATUS_OK;
+}
+
+// The password a request opens its document with, for the readers that
+// open a second, core document over the same bytes.
+std::optional<std::string> DocumentPassword(
+    const pdfv1::PdfDocument& document) {
+  if (!document.has_password()) return std::nullopt;
+  return document.password();
 }
 
 // The one engine identity string, shared by Probe capabilities and
@@ -489,6 +498,8 @@ grpc::Status PopplerServiceImpl::Parse(
     return grpc::Status::OK;
   }
   bool client_ok = true;
+  // Reported in the trailer.
+  std::vector<pdfv1::ParseWarning> warnings;
 
   // Document-level families.
   if (WantFamily(*request, pdfv1::PDF_FAMILY_DOC_METADATA)) {
@@ -554,26 +565,30 @@ grpc::Status PopplerServiceImpl::Parse(
       client_ok = writer->Write(msg);
     }
   }
+  // Embedded files come from poppler's core API (src/poppler_attachments.h):
+  // the cpp wrapper cuts a UTF-16 name short and inflates a whole payload
+  // before handing it out.
   if (client_ok && loaded.doc->has_embedded_files() &&
       WantFamily(*request, pdfv1::PDF_FAMILY_ATTACHMENTS)) {
-    for (poppler::embedded_file* file : loaded.doc->embedded_files()) {
-      if (file == nullptr || !file->is_valid()) continue;
-      pdfv1::ParseResponse msg;
-      auto* meta = msg.mutable_attachment();
-      meta->set_name(file->name());
-      std::string desc = ToUtf8(file->description());
-      if (!desc.empty()) meta->set_description(desc);
-      if (file->size() >= 0) {
-        meta->set_size_bytes(static_cast<uint64_t>(file->size()));
-      }
-      if (!file->mime_type().empty()) meta->set_mime_type(file->mime_type());
-      if (request->options().include_attachment_data()) {
-        poppler::byte_array data = file->data();
-        meta->set_data(std::string(data.begin(), data.end()));
-      }
-      client_ok = writer->Write(msg);
-      if (!client_ok) break;
+    std::optional<uint64_t> max_data_bytes;
+    if (request->options().include_attachment_data()) {
+      max_data_bytes = limits_.max_attachment_bytes;
     }
+    client_ok = ReadAttachments(
+        *resolved.bytes, DocumentPassword(request->document()), max_data_bytes,
+        [&](pdfv1::AttachmentMeta&& meta, AttachmentData data) {
+          if (data == AttachmentData::kOverLimit) {
+            pdfv1::ParseWarning& warning = warnings.emplace_back();
+            warning.set_family(pdfv1::PDF_FAMILY_ATTACHMENTS);
+            warning.set_message("attachment \"" + meta.name() +
+                                "\" decodes to more than " +
+                                std::to_string(limits_.max_attachment_bytes) +
+                                " bytes; its data is omitted");
+          }
+          pdfv1::ParseResponse msg;
+          *msg.mutable_attachment() = std::move(meta);
+          return writer->Write(msg);
+        });
   }
 
   // Font table from the document surface.
@@ -605,11 +620,9 @@ grpc::Status PopplerServiceImpl::Parse(
   // cpp wrapper has no forms surface.
   std::map<int, std::vector<pdfv1::FormField>> form_fields;
   if (WantFamily(*request, pdfv1::PDF_FAMILY_FORM_FIELDS)) {
-    std::optional<std::string> password;
-    if (request->document().has_password()) {
-      password = request->document().password();
-    }
-    form_fields = ReadFormFields(*resolved.bytes, password, begin, end);
+    form_fields = ReadFormFields(*resolved.bytes,
+                                 DocumentPassword(request->document()), begin,
+                                 end);
   }
   for (int i = begin; client_ok && i < end; ++i) {
     poppler::page* page = pages[static_cast<size_t>(i)].get();
@@ -663,6 +676,9 @@ grpc::Status PopplerServiceImpl::Parse(
     auto* entry = trailer->add_counts();
     entry->set_family(family);
     entry->set_count(count);
+  }
+  for (pdfv1::ParseWarning& warning : warnings) {
+    *trailer->add_warnings() = std::move(warning);
   }
   writer->Write(trailer_msg);
   return grpc::Status::OK;

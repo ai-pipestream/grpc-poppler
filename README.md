@@ -21,15 +21,19 @@ and grpc-pdfium's boxes), starts each word's quad at its lower-left corner
 in its reading direction, and reports the page's real /Rotate (0, 90, 180
 or 270). On top of the floor, the cpp surface
 fills document metadata (info keys plus the XMP packet), permission bits
-for encrypted documents, the outline, embedded files, and the document
-font table. AcroForm widgets (form fields) come from poppler's core API,
-which the cpp wrapper does not expose: `src/poppler_forms.cpp` opens a
-core document over the same bytes and reports each widget with its
-inherited field type, /Ff flags and tooltip and the widget's own /AS
-appearance state. The poppler build installs the core headers for this
-(`ENABLE_UNSTABLE_API_ABI_HEADERS`); the library is the one poppler-cpp
-already links. Annotations and the structure tree are still reported
-unsupported, each with the reason; deep graphics resources are not
+for encrypted documents, the outline, and the document font table.
+AcroForm widgets (form fields) come from poppler's core API, which the cpp
+wrapper does not expose: `src/poppler_forms.cpp` opens a core document over
+the same bytes and reports each widget with its inherited field type, /Ff
+flags and tooltip and the widget's own /AS appearance state. Embedded files
+come from the core API too (`src/poppler_attachments.cpp`): the cpp wrapper
+cuts a UTF-16 file name at its first NUL byte and inflates a whole payload
+before handing it out, while the core file spec gives the raw name, decoded
+here as a PDF text string, and the stream, decoded block by block under a
+size cap (see Resource limits). The poppler build installs the core headers
+for this (`ENABLE_UNSTABLE_API_ABI_HEADERS`); the library is the one
+poppler-cpp already links. Annotations and the structure tree are still
+reported unsupported, each with the reason; deep graphics resources are not
 poppler's to give.
 
 ## Build and test
@@ -82,6 +86,20 @@ front process, which owns the client-facing wire). Two env knobs bound it:
 Setting either to `0` disables caching; a document larger than the byte
 ceiling is never stored. SHA-256 comes from the boringssl `crypto` target
 the gRPC build already compiles; there is no new dependency.
+
+## Resource limits
+
+One request cannot make the service decode without bound. The defaults
+(`ResourceLimits`, `src/poppler_service_impl.h`) also keep every message
+inside the server's 520 MiB message limit:
+
+| Bound | Default | Past it |
+|---|---|---|
+| Attachment data (`include_attachment_data`) | 256 MiB decoded, per attachment | the attachment is listed without `data`; the trailer carries a `ParseWarning` naming it |
+
+A set `PageRange` must have `end` greater than `begin` and a `begin` below
+2^31 (poppler indexes pages with an int); anything else is
+`INVALID_ARGUMENT`. An `end` past the document stops at its last page.
 
 ## Docker
 

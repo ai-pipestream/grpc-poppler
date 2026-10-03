@@ -142,9 +142,10 @@ pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
 # default search root (/usr/include). A poppler built under its own prefix
 # (the image's /opt/poppler) needs the includedir itself on the path too.
 target_include_directories(PkgConfig::POPPLER_CPP INTERFACE "${POPPLER_CPP_INCLUDEDIR}")
-# The core library, for the AcroForm widgets poppler-cpp does not expose
-# (src/poppler_forms.cpp). Its headers are installed by poppler's
-# ENABLE_UNSTABLE_API_ABI_HEADERS option; the library is the one
+# The core library, for what poppler-cpp does not expose: the AcroForm
+# widgets (src/poppler_forms.cpp) and the embedded files' raw names and
+# streams (src/poppler_attachments.cpp). Its headers are installed by
+# poppler's ENABLE_UNSTABLE_API_ABI_HEADERS option; the library is the one
 # poppler-cpp already links, so the runtime closure does not change.
 pkg_check_modules(POPPLER_CORE REQUIRED IMPORTED_TARGET poppler)
 
@@ -156,6 +157,8 @@ add_executable(grpc_poppler
   src/main.cpp
   src/poppler_service_impl.cpp
   src/poppler_forms.cpp
+  src/poppler_attachments.cpp
+  src/utf8.cpp
   src/document_cache.cpp
   src/sha256.cpp)
 target_include_directories(grpc_poppler PRIVATE src)
@@ -169,6 +172,8 @@ add_executable(poppler_contract_test
   test/contract_roundtrip_test.cpp
   src/poppler_service_impl.cpp
   src/poppler_forms.cpp
+  src/poppler_attachments.cpp
+  src/utf8.cpp
   src/document_cache.cpp
   src/sha256.cpp)
 target_include_directories(poppler_contract_test PRIVATE src)

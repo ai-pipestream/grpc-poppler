@@ -2,6 +2,7 @@
 // document families (metadata with XMP, outline, attachments, fonts) over
 // the hello.pdf and rich.pdf fixtures.
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -37,6 +38,14 @@ std::string ReadFile(const std::string& path) {
   return buf.str();
 }
 
+// Bounds a call whose regression could otherwise hang the test: a client
+// that stops reading a stream (say, at a message it cannot parse) while the
+// server still writes waits on its status forever once flow control stops
+// the server.
+void SetDeadline(grpc::ClientContext* ctx) {
+  ctx->set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(60));
+}
+
 bool Near(double a, double b) { return std::abs(a - b) < 0.01; }
 
 bool SameBox(const pdfv1::BoundingBox& a, const pdfv1::BoundingBox& b) {
@@ -64,7 +73,10 @@ int main(int argc, char** argv) {
   const std::string hello = ReadFile(dir + "/hello.pdf");
   const std::string rich = ReadFile(dir + "/rich.pdf");
   const std::string frames = ReadFile(dir + "/frames.pdf");
-  Check(!hello.empty() && !rich.empty() && !frames.empty(), "fixtures read");
+  const std::string encodings = ReadFile(dir + "/encodings.pdf");
+  Check(!hello.empty() && !rich.empty() && !frames.empty() &&
+            !encodings.empty(),
+        "fixtures read");
 
   grpc_poppler::PopplerServiceImpl service;
   grpc::ServerBuilder builder;
@@ -77,6 +89,22 @@ int main(int argc, char** argv) {
   auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
                                      grpc::InsecureChannelCredentials());
   auto stub = pdfv1::PdfBackendService::NewStub(channel);
+
+  // A second service with tight resource limits, to reach them with small
+  // fixtures.
+  grpc_poppler::ResourceLimits tight_limits;
+  tight_limits.max_attachment_bytes = 4096;
+  grpc_poppler::PopplerServiceImpl tight_service({8, 1u << 30}, tight_limits);
+  grpc::ServerBuilder tight_builder;
+  int tight_port = 0;
+  tight_builder.AddListeningPort("127.0.0.1:0",
+                                 grpc::InsecureServerCredentials(), &tight_port);
+  tight_builder.RegisterService(&tight_service);
+  std::unique_ptr<grpc::Server> tight_server = tight_builder.BuildAndStart();
+  Check(tight_server != nullptr && tight_port != 0, "tight-limit server up");
+  auto tight_stub = pdfv1::PdfBackendService::NewStub(
+      grpc::CreateChannel("127.0.0.1:" + std::to_string(tight_port),
+                          grpc::InsecureChannelCredentials()));
 
   {
     grpc::ClientContext ctx;
@@ -201,6 +229,72 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Attachments are read through poppler's core API (encodings.pdf, from
+  // test/fixtures/make_encodings_pdf.py). Names are PDF text strings and
+  // arrive as UTF-8 whatever their encoding in the file; the MIME type, a
+  // PDF name, is made valid UTF-8, since the client cannot parse a message
+  // whose string field is not and would lose the whole stream.
+  auto parse_attachments = [&encodings](pdfv1::PdfBackendService::Stub& client,
+                                        std::map<std::string, pdfv1::AttachmentMeta>* found,
+                                        std::vector<pdfv1::ParseWarning>* warnings) {
+    grpc::ClientContext ctx;
+    SetDeadline(&ctx);
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(encodings);
+    request.add_families(pdfv1::PDF_FAMILY_ATTACHMENTS);
+    request.mutable_options()->set_include_attachment_data(true);
+    auto reader = client.Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    while (reader->Read(&msg)) {
+      if (msg.has_attachment()) (*found)[msg.attachment().name()] = msg.attachment();
+      if (msg.has_trailer()) {
+        warnings->assign(msg.trailer().warnings().begin(),
+                         msg.trailer().warnings().end());
+      }
+    }
+    return reader->Finish().ok();
+  };
+  const std::string resume_name = "r\xc3\xa9sum\xc3\xa9.txt";
+  const std::string cafe_name = "caf\xc3\xa9.csv";
+  {
+    std::map<std::string, pdfv1::AttachmentMeta> found;
+    std::vector<pdfv1::ParseWarning> warnings;
+    Check(parse_attachments(*stub, &found, &warnings),
+          "encodings.pdf attachments stream finishes OK");
+    Check(found.size() == 3, "all three attachments listed");
+    Check(found.count(resume_name) == 1, "a UTF-16 /UF name is decoded");
+    if (found.count(resume_name) == 1) {
+      const auto& resume = found[resume_name];
+      Check(resume.mime_type() == "text/\xc3\xa9",
+            "a MIME name that is not UTF-8 arrives as valid UTF-8");
+      Check(resume.size_bytes() == 11 && resume.data() == "plain text\n",
+            "the UTF-16-named attachment carries its bytes");
+    }
+    Check(found.count(cafe_name) == 1 &&
+              found[cafe_name].data() == "a,b\n1,2\n",
+          "a PDFDocEncoding /F name is decoded");
+    Check(found.count("zeros.bin") == 1 &&
+              found["zeros.bin"].data() == std::string(65536, '\0'),
+          "an attachment under the cap carries all its inflated bytes");
+    Check(warnings.empty(), "no warnings under the default cap");
+  }
+  // Under a 4 KiB cap the attachment that inflates to 64 KiB is listed
+  // without its data and the trailer says why; the others are unaffected.
+  {
+    std::map<std::string, pdfv1::AttachmentMeta> found;
+    std::vector<pdfv1::ParseWarning> warnings;
+    Check(parse_attachments(*tight_stub, &found, &warnings),
+          "capped attachments stream finishes OK");
+    Check(found.count("zeros.bin") == 1 && !found["zeros.bin"].has_data(),
+          "an attachment over the cap is listed without data");
+    Check(found.count(resume_name) == 1 && found[resume_name].has_data(),
+          "an attachment under the cap keeps its data");
+    Check(warnings.size() == 1 &&
+              warnings[0].family() == pdfv1::PDF_FAMILY_ATTACHMENTS &&
+              warnings[0].message().find("zeros.bin") != std::string::npos,
+          "the trailer warns about the omitted data");
+  }
+
   // Page frames. frames.pdf draws one word with its baseline at (100, 700)
   // in user space under every /Rotate and with offset CropBoxes
   // (test/fixtures/make_frames_pdf.py). Geometry comes back in the
@@ -208,6 +302,7 @@ int main(int argc, char** argv) {
   // origin included, so every page reports the upright page's box.
   {
     grpc::ClientContext ctx;
+    SetDeadline(&ctx);
     pdfv1::ParseRequest request;
     request.mutable_document()->set_data(frames);
     auto reader = stub->Parse(&ctx, request);
@@ -646,6 +741,7 @@ int main(int argc, char** argv) {
     tiny_server->Shutdown();
   }
 
+  tight_server->Shutdown();
   server->Shutdown();
   if (failures == 0) {
     std::printf("poppler_contract: all checks passed\n");
