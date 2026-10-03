@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -167,26 +168,44 @@ int main(int argc, char** argv) {
     bool font_named = false;
     std::vector<pdfv1::FormField> form_fields;
     std::map<int, uint64_t> counts;
+    // What the stream carried, family by family, to hold the trailer to.
+    std::map<int, uint64_t> received;
+    received[pdfv1::PDF_FAMILY_PAGE_INVENTORY] =
+        static_cast<uint64_t>(msg.header().pages_size());
+    std::function<uint64_t(const pdfv1::OutlineNode&)> outline_nodes =
+        [&outline_nodes](const pdfv1::OutlineNode& node) -> uint64_t {
+      uint64_t n = 1;
+      for (const auto& child : node.children()) n += outline_nodes(child);
+      return n;
+    };
     while (reader->Read(&msg)) {
       if (msg.has_page()) {
         for (const auto& cell : msg.page().text_cells()) {
           all_text += cell.text() + " ";
         }
         for (const auto& f : msg.page().form_fields()) form_fields.push_back(f);
+        received[pdfv1::PDF_FAMILY_TEXT_CELLS] += msg.page().text_cells_size();
+        received[pdfv1::PDF_FAMILY_FORM_FIELDS] += msg.page().form_fields_size();
       } else if (msg.has_doc_meta()) {
         title = msg.doc_meta().title();
         xmp = msg.doc_meta().xmp_xml();
+        ++received[pdfv1::PDF_FAMILY_DOC_METADATA];
       } else if (msg.has_outline()) {
         outline_roots = msg.outline().roots_size();
+        for (const auto& root : msg.outline().roots()) {
+          received[pdfv1::PDF_FAMILY_OUTLINE] += outline_nodes(root);
+        }
       } else if (msg.has_attachment()) {
         ++attachments;
         attachment_data = msg.attachment().data();
+        ++received[pdfv1::PDF_FAMILY_ATTACHMENTS];
       } else if (msg.has_fonts()) {
         for (const auto& f : msg.fonts().fonts()) {
           if (f.base_name().find("Helvetica") != std::string::npos) {
             font_named = true;
           }
         }
+        received[pdfv1::PDF_FAMILY_FONTS] += msg.fonts().fonts_size();
       } else if (msg.has_trailer()) {
         for (const auto& c : msg.trailer().counts()) {
           counts[c.family()] = c.count();
@@ -203,6 +222,20 @@ int main(int argc, char** argv) {
           "attachment bytes round-tripped");
     Check(font_named, "font table names Helvetica");
     Check(counts[pdfv1::PDF_FAMILY_TEXT_CELLS] >= 1, "trailer counts cells");
+    // The trailer totals everything emitted on the stream, the
+    // document-level families and the font table included.
+    for (int f = pdfv1::PdfFamily_MIN + 1; f <= pdfv1::PdfFamily_MAX; ++f) {
+      Check(counts[f] == received[f],
+            ("the trailer counts " +
+             pdfv1::PdfFamily_Name(static_cast<pdfv1::PdfFamily>(f)) +
+             " as received")
+                .c_str());
+    }
+    Check(received[pdfv1::PDF_FAMILY_DOC_METADATA] == 1 &&
+              received[pdfv1::PDF_FAMILY_OUTLINE] == 2 &&
+              received[pdfv1::PDF_FAMILY_ATTACHMENTS] == 1 &&
+              received[pdfv1::PDF_FAMILY_FONTS] >= 2,
+          "rich.pdf carries every document-level family");
 
     // AcroForm widgets, read through poppler's core API, in /Annots order.
     Check(form_fields.size() == 2, "both form field widgets extracted");
@@ -297,6 +330,46 @@ int main(int argc, char** argv) {
               warnings[0].family() == pdfv1::PDF_FAMILY_ATTACHMENTS &&
               warnings[0].message().find("zeros.bin") != std::string::npos,
           "the trailer warns about the omitted data");
+  }
+
+  // Only requested families stream. A metadata-only request gets no page
+  // chunks and no font table; a text-only request gets cells whose font ids
+  // name fonts it did not ask for, and no font table either.
+  {
+    auto kinds = [&rich](pdfv1::PdfBackendService::Stub& client,
+                         std::vector<pdfv1::PdfFamily> families) {
+      grpc::ClientContext ctx;
+      SetDeadline(&ctx);
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(rich);
+      for (const auto family : families) request.add_families(family);
+      auto reader = client.Parse(&ctx, request);
+      pdfv1::ParseResponse msg;
+      std::map<pdfv1::ParseResponse::PayloadCase, int> seen;
+      int cells = 0;
+      while (reader->Read(&msg)) {
+        ++seen[msg.payload_case()];
+        if (msg.has_page()) cells += msg.page().text_cells_size();
+      }
+      if (!reader->Finish().ok()) seen.clear();
+      seen[pdfv1::ParseResponse::PAYLOAD_NOT_SET] = cells;
+      return seen;
+    };
+    auto meta_only = kinds(*stub, {pdfv1::PDF_FAMILY_DOC_METADATA});
+    Check(meta_only[pdfv1::ParseResponse::kHeader] == 1 &&
+              meta_only[pdfv1::ParseResponse::kDocMeta] == 1 &&
+              meta_only[pdfv1::ParseResponse::kTrailer] == 1,
+          "a metadata-only parse carries the header, metadata and trailer");
+    Check(meta_only[pdfv1::ParseResponse::kPage] == 0 &&
+              meta_only[pdfv1::ParseResponse::kFonts] == 0 &&
+              meta_only[pdfv1::ParseResponse::kAttachment] == 0,
+          "a metadata-only parse sends no page chunks, fonts or attachments");
+    auto text_only = kinds(*stub, {pdfv1::PDF_FAMILY_TEXT_CELLS});
+    Check(text_only[pdfv1::ParseResponse::kPage] == 1 &&
+              text_only[pdfv1::ParseResponse::PAYLOAD_NOT_SET] > 0,
+          "a text-only parse carries the page's cells");
+    Check(text_only[pdfv1::ParseResponse::kFonts] == 0,
+          "a text-only parse sends no font table");
   }
 
   // Font names and widget state names are PDF names, raw bytes in the

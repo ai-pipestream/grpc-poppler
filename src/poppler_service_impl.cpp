@@ -444,11 +444,12 @@ pdfv1::FontKind MapFontKind(poppler::font_info::type_enum type) {
 }
 
 void FillOutlineItem(const poppler::toc_item* item, pdfv1::OutlineNode* node,
-                     int depth) {
+                     int depth, uint64_t* count) {
   node->set_title(ToUtf8(item->title()));
+  ++*count;
   if (depth >= 64) return;
   for (const poppler::toc_item* child : item->children()) {
-    FillOutlineItem(child, node->add_children(), depth + 1);
+    FillOutlineItem(child, node->add_children(), depth + 1, count);
   }
 }
 
@@ -531,7 +532,11 @@ grpc::Status PopplerServiceImpl::Parse(
     return grpc::Status::OK;
   }
   bool client_ok = true;
-  // Reported in the trailer.
+  // Reported in the trailer: the items this stream carried, family by
+  // family, and the warnings.
+  std::map<pdfv1::PdfFamily, uint64_t> counts;
+  counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] =
+      static_cast<uint64_t>(header->pages_size());
   std::vector<pdfv1::ParseWarning> warnings;
 
   // Document-level families.
@@ -567,6 +572,7 @@ grpc::Status PopplerServiceImpl::Parse(
                             std::to_string(minor));
     }
     if (loaded.doc->is_linearized()) meta->set_linearized(true);
+    ++counts[pdfv1::PDF_FAMILY_DOC_METADATA];
     client_ok = WriteUngated(gate, writer, msg);
   }
   if (client_ok && loaded.doc->is_encrypted() &&
@@ -584,6 +590,7 @@ grpc::Status PopplerServiceImpl::Parse(
     enc->set_can_assemble(loaded.doc->has_permission(poppler::perm_assemble));
     enc->set_can_print_high_res(
         loaded.doc->has_permission(poppler::perm_print_high_resolution));
+    ++counts[pdfv1::PDF_FAMILY_ENCRYPTION_INFO];
     client_ok = WriteUngated(gate, writer, msg);
   }
   if (client_ok && WantFamily(*request, pdfv1::PDF_FAMILY_OUTLINE)) {
@@ -593,7 +600,8 @@ grpc::Status PopplerServiceImpl::Parse(
       pdfv1::ParseResponse msg;
       auto* chunk = msg.mutable_outline();
       for (const poppler::toc_item* item : toc->root()->children()) {
-        FillOutlineItem(item, chunk->add_roots(), 0);
+        FillOutlineItem(item, chunk->add_roots(), 0,
+                        &counts[pdfv1::PDF_FAMILY_OUTLINE]);
       }
       client_ok = WriteUngated(gate, writer, msg);
     }
@@ -620,13 +628,15 @@ grpc::Status PopplerServiceImpl::Parse(
           }
           pdfv1::ParseResponse msg;
           *msg.mutable_attachment() = std::move(meta);
+          ++counts[pdfv1::PDF_FAMILY_ATTACHMENTS];
           return WriteUngated(gate, writer, msg);
         });
   }
 
   // Font table from the document surface.
   FontInterner fonts;
-  if (client_ok && WantFamily(*request, pdfv1::PDF_FAMILY_FONTS)) {
+  const bool want_fonts = WantFamily(*request, pdfv1::PDF_FAMILY_FONTS);
+  if (client_ok && want_fonts) {
     pdfv1::ParseResponse msg;
     auto* chunk = msg.mutable_fonts();
     for (const poppler::font_info& info : loaded.doc->fonts()) {
@@ -644,6 +654,8 @@ grpc::Status PopplerServiceImpl::Parse(
       ref->set_embedded(info.is_embedded());
     }
     if (chunk->fonts_size() > 0) {
+      counts[pdfv1::PDF_FAMILY_FONTS] +=
+          static_cast<uint64_t>(chunk->fonts_size());
       client_ok = WriteUngated(gate, writer, msg);
     }
   }
@@ -651,18 +663,20 @@ grpc::Status PopplerServiceImpl::Parse(
   const auto [begin, end] =
       SelectPages(request->has_pages(), request->pages(), page_count);
 
-  std::map<pdfv1::PdfFamily, uint64_t> counts;
-  counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
   const bool want_text = WantFamily(*request, pdfv1::PDF_FAMILY_TEXT_CELLS);
+  const bool want_fields = WantFamily(*request, pdfv1::PDF_FAMILY_FORM_FIELDS);
   // Form widgets come from poppler's core API (src/poppler_forms.h); the
   // cpp wrapper has no forms surface.
   std::map<int, std::vector<pdfv1::FormField>> form_fields;
-  if (WantFamily(*request, pdfv1::PDF_FAMILY_FORM_FIELDS)) {
+  if (want_fields) {
     form_fields = ReadFormFields(*resolved.bytes,
                                  DocumentPassword(request->document()), begin,
                                  end);
   }
-  for (int i = begin; client_ok && i < end; ++i) {
+  // Page chunks carry only page-level families; a request for none of them
+  // gets no chunks.
+  const bool want_pages = want_text || want_fields;
+  for (int i = begin; client_ok && want_pages && i < end; ++i) {
     if (context->IsCancelled()) return grpc::Status::CANCELLED;
     poppler::page* page = pages[static_cast<size_t>(i)].get();
     if (page == nullptr) continue;
@@ -684,7 +698,7 @@ grpc::Status PopplerServiceImpl::Parse(
             bool is_new = false;
             uint32_t id = fonts.Intern(name, &is_new);
             cell->set_font_id(id);
-            if (is_new) {
+            if (is_new && want_fonts) {
               pdfv1::ParseResponse fonts_msg;
               auto* ref = fonts_msg.mutable_fonts()->add_fonts();
               ref->set_font_id(id);
