@@ -73,7 +73,8 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   too) and a prebuilt font cache. The build stage must stay on a glibc no
   newer than the runtime base's (2.41). `GRPC_POPPLER_RUNTIME_IMAGE`
   swaps the base. `scripts/smoke-test.sh IMAGE` is the boot gate (closure,
-  boot to listening under the hardened flags, uid).
+  boot to listening under the hardened flags, uid, license texts and the
+  source label).
 - **Publishing**: `.github/workflows/publish.yml` builds, smoke-tests, and
   only then pushes `docker.io/pipestreamai/grpc-poppler:latest` on every
   push to `main` and a `:<version>` tag via `workflow_dispatch`; auth is the

@@ -11,6 +11,8 @@
 #      hardened run flags (read-only rootfs, no capabilities), and runs as
 #      uid 65532. The prebuilt fontconfig cache means a read-only rootfs is
 #      enough: nothing is written at startup.
+#   3. licenses: the image is GPL object code, so it carries the license
+#      texts (this repository's and poppler's) and names its source.
 set -euo pipefail
 
 usage() {
@@ -75,5 +77,21 @@ if [[ -n "$foreign_uid" ]]; then
   echo "a process is not running as uid 65532" >&2
   exit 1
 fi
+
+echo "== smoke: license texts and source label"
+for path in /usr/share/doc/grpc-poppler/LICENSE /usr/share/doc/poppler/COPYING \
+  /usr/share/doc/poppler/COPYING3; do
+  if ! docker cp "$container:$path" - >/dev/null 2>&1; then
+    echo "$image does not carry $path" >&2
+    exit 1
+  fi
+done
+source_label=$(docker image inspect \
+  -f '{{index .Config.Labels "org.opencontainers.image.source"}}' "$image")
+if [[ -z "$source_label" || "$source_label" == "<no value>" ]]; then
+  echo "$image has no org.opencontainers.image.source label" >&2
+  exit 1
+fi
+echo "source: $source_label"
 
 echo "smoke-test: OK ($image)"

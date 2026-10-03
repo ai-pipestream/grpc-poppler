@@ -1,9 +1,16 @@
 # grpc-poppler
 
-**License: GPL-3.0-or-later.** This service links Poppler (GPL-2-or-later),
-so the combined work is GPL; the GPL dependency of the parsing fleet lives
-in this one container and nowhere else. It ships as an optional compose
-profile and is excluded from default release artifacts: it exists as the
+**License: GPL-3.0-or-later.** This service links Poppler, whose code
+inherited from xpdf is licensed under the GPL version 2 or version 3 only
+(Poppler's later code is GPL-2.0-or-later), and gRPC, protobuf and abseil
+under Apache-2.0, which combines with the GPL version 3 but not version 2;
+so the combined work is GPL-3.0. The image carries this repository's
+LICENSE and Poppler's COPYING and COPYING3 under `/usr/share/doc`, and its
+`org.opencontainers.image.source` label names this repository as the
+source. This is meant to be the parsing fleet's one GPL container; gRParse
+still links poppler-cpp in-process until its move to the backend contract
+(milestone M6) lands. It ships as an optional compose profile and is
+excluded from default release artifacts: it exists as the
 extraction-quality reference and the differential leg, not as part of the
 default stack.
 
@@ -140,8 +147,9 @@ image whose glibc is 2.41 or newer.
 `scripts/smoke-test.sh IMAGE` is the boot gate CI and the publish workflow
 run before any push: the library closure resolves inside the image (the
 dynamic loader reports it, since the base has no `ldd`), the server
-reaches its "listening on" line under `--read-only --cap-drop ALL`, and
-every process runs as uid 65532.
+reaches its "listening on" line under `--read-only --cap-drop ALL`,
+every process runs as uid 65532, and the license texts and the source
+label are in place.
 
 ## Compose profile
 
