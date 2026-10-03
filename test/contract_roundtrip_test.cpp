@@ -4,8 +4,9 @@
 // document families (metadata with XMP, outline, attachments, fonts) over
 // the hello.pdf and rich.pdf fixtures, the page frame on rotated and
 // cropped pages (frames.pdf), names that are not UTF-8 in the file and a
-// decode cap (encodings.pdf), page ranges, Render bounds, and the arm64
-// gate under a stalled client.
+// decode cap (encodings.pdf), pages poppler cannot load
+// (missing_pages.pdf), page ranges, Render bounds, and the arm64 gate under
+// a stalled client.
 
 #include <chrono>
 #include <cmath>
@@ -83,8 +84,9 @@ int main(int argc, char** argv) {
   const std::string rich = ReadFile(dir + "/rich.pdf");
   const std::string frames = ReadFile(dir + "/frames.pdf");
   const std::string encodings = ReadFile(dir + "/encodings.pdf");
+  const std::string missing_pages = ReadFile(dir + "/missing_pages.pdf");
   Check(!hello.empty() && !rich.empty() && !frames.empty() &&
-            !encodings.empty(),
+            !encodings.empty() && !missing_pages.empty(),
         "fixtures read");
 
   grpc_poppler::PopplerServiceImpl service;
@@ -571,6 +573,58 @@ int main(int argc, char** argv) {
                 Near(q.x3(), b.x0()) && Near(q.y3(), b.y0()),
             "the upward word's quad follows its reading direction");
     }
+  }
+
+  // missing_pages.pdf counts three pages and holds one
+  // (test/fixtures/make_missing_pages_pdf.py), so poppler cannot load pages
+  // 1 and 2. Parse leaves them out and names each in a trailer warning;
+  // Render renders page 0 and then fails naming page 1.
+  {
+    grpc::ClientContext ctx;
+    SetDeadline(&ctx);
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(missing_pages);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    int inventory = -1;
+    std::vector<uint32_t> chunks;
+    std::vector<uint32_t> warned_pages;
+    while (reader->Read(&msg)) {
+      if (msg.has_header()) inventory = msg.header().pages_size();
+      if (msg.has_page()) chunks.push_back(msg.page().page_index());
+      if (msg.has_trailer()) {
+        for (const auto& warning : msg.trailer().warnings()) {
+          if (warning.has_page_index()) {
+            warned_pages.push_back(warning.page_index());
+          }
+        }
+      }
+    }
+    Check(reader->Finish().ok(), "missing_pages.pdf parses");
+    Check(inventory == 1 && chunks == std::vector<uint32_t>{0},
+          "only the loadable page is inventoried and chunked");
+    Check(warned_pages == std::vector<uint32_t>({1, 2}),
+          "the trailer warns about each page poppler cannot load");
+  }
+  {
+    grpc::ClientContext ctx;
+    SetDeadline(&ctx);
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_data(missing_pages);
+    request.set_dpi(36.0);
+    request.set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
+    auto reader = stub->Render(&ctx, request);
+    pdfv1::RenderResponse msg;
+    std::vector<uint32_t> rasters;
+    while (reader->Read(&msg)) {
+      if (msg.has_raster()) rasters.push_back(msg.raster().page_index());
+    }
+    const grpc::Status status = reader->Finish();
+    Check(rasters == std::vector<uint32_t>{0},
+          "the loadable page renders before the failure");
+    Check(status.error_code() == grpc::StatusCode::INTERNAL &&
+              status.error_message().find("page 1") != std::string::npos,
+          "a page poppler cannot load fails the Render, naming the page");
   }
 
   // Render hello.pdf at 72 DPI: BGR24, the same surface gRParse consumes.

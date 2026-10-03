@@ -497,10 +497,17 @@ grpc::Status PopplerServiceImpl::Parse(
   pdfv1::ParseResponse header_msg;
   auto* header = header_msg.mutable_header();
   FillCapabilities(loaded, header->mutable_capabilities());
+  // Pages the document counts but poppler cannot load (a page tree that
+  // holds fewer pages than its /Count): left out of the inventory, and
+  // each named by a warning in the trailer.
+  std::vector<int> unloadable_pages;
   for (int i = 0; i < page_count; ++i) {
     pages[static_cast<size_t>(i)].reset(loaded.doc->create_page(i));
     poppler::page* page = pages[static_cast<size_t>(i)].get();
-    if (page == nullptr) continue;
+    if (page == nullptr) {
+      unloadable_pages.push_back(i);
+      continue;
+    }
     auto* info = header->add_pages();
     info->set_page_index(static_cast<uint32_t>(i));
     const bool quarter_turn = IsQuarterTurn(*page);
@@ -532,6 +539,14 @@ grpc::Status PopplerServiceImpl::Parse(
   counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] =
       static_cast<uint64_t>(header->pages_size());
   std::vector<pdfv1::ParseWarning> warnings;
+  for (const int index : unloadable_pages) {
+    pdfv1::ParseWarning& warning = warnings.emplace_back();
+    warning.set_page_index(static_cast<uint32_t>(index));
+    warning.set_family(pdfv1::PDF_FAMILY_PAGE_INVENTORY);
+    warning.set_message("poppler could not load page " +
+                        std::to_string(index) +
+                        "; it is left out of the inventory and the page chunks");
+  }
 
   // Document-level families.
   if (WantFamily(*request, pdfv1::PDF_FAMILY_DOC_METADATA)) {
@@ -792,7 +807,11 @@ grpc::Status PopplerServiceImpl::Render(
       // The page and its image are freed here, under the gate, before the
       // write; the message holds the only copy of the pixels on the wire.
       std::unique_ptr<poppler::page> page(loaded.doc->create_page(i));
-      if (page == nullptr) continue;
+      if (page == nullptr) {
+        return grpc::Status(
+            grpc::StatusCode::INTERNAL,
+            "poppler could not load page " + std::to_string(i));
+      }
       // The raster's size is known before splash allocates it: the CropBox
       // at the requested dpi (rounded up here; splash rounds to nearest).
       const poppler::rectf box = page->page_rect();

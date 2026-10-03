@@ -106,8 +106,12 @@ inside the server's 520 MiB message limit:
 | Render `dpi` | 1200 | `INVALID_ARGUMENT`, as are zero, negative, NaN and infinite values |
 | Pixels per rendered page | 150 million (a 450 MB BGR raster) | `RESOURCE_EXHAUSTED`, checked from the page size before splash allocates |
 
-A page poppler cannot render ends the Render stream with `INTERNAL` naming
-the page, rather than being left out of the stream.
+A page poppler cannot load or render ends the Render stream with
+`INTERNAL` naming the page, rather than being left out of the stream (the
+contract has no typed verdict for one page once rasters have started). On
+`Parse` a page it cannot load, as when a page tree holds fewer pages than
+its `/Count`, is left out of the inventory and the page chunks, and the
+trailer carries a `ParseWarning` with its `page_index`.
 
 A set `PageRange` must have `end` greater than `begin`, the contract's one
 rule for it; anything else is `INVALID_ARGUMENT`. An `end` past the
