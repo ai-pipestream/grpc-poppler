@@ -16,6 +16,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -343,11 +344,20 @@ int main(int argc, char** argv) {
   }
 
   // Only requested families stream. A metadata-only request gets no page
-  // chunks and no font table; a text-only request gets cells whose font ids
-  // name fonts it did not ask for, and no font table either.
+  // chunks and no font table. A text-only request gets the document font
+  // table's entries its cells cite, since a font_id must name a FontRef on
+  // the stream, and no others.
   {
-    auto kinds = [&rich](pdfv1::PdfBackendService::Stub& client,
-                         std::vector<pdfv1::PdfFamily> families) {
+    // What a parse of rich.pdf for some families carried.
+    struct Carried {
+      std::map<pdfv1::ParseResponse::PayloadCase, int> messages;
+      int cells = 0;
+      // Cells whose font_id names no FontRef received before them.
+      int dangling_font_ids = 0;
+      bool ok = false;
+    };
+    auto carried = [&rich](pdfv1::PdfBackendService::Stub& client,
+                           std::vector<pdfv1::PdfFamily> families) {
       grpc::ClientContext ctx;
       SetDeadline(&ctx);
       pdfv1::ParseRequest request;
@@ -355,31 +365,44 @@ int main(int argc, char** argv) {
       for (const auto family : families) request.add_families(family);
       auto reader = client.Parse(&ctx, request);
       pdfv1::ParseResponse msg;
-      std::map<pdfv1::ParseResponse::PayloadCase, int> seen;
-      int cells = 0;
+      Carried out;
+      std::set<uint32_t> font_ids;
       while (reader->Read(&msg)) {
-        ++seen[msg.payload_case()];
-        if (msg.has_page()) cells += msg.page().text_cells_size();
+        ++out.messages[msg.payload_case()];
+        if (msg.has_fonts()) {
+          for (const auto& font : msg.fonts().fonts()) {
+            font_ids.insert(font.font_id());
+          }
+        }
+        if (msg.has_page()) {
+          out.cells += msg.page().text_cells_size();
+          for (const auto& cell : msg.page().text_cells()) {
+            if (cell.has_font_id() && font_ids.count(cell.font_id()) == 0) {
+              ++out.dangling_font_ids;
+            }
+          }
+        }
       }
-      if (!reader->Finish().ok()) seen.clear();
-      seen[pdfv1::ParseResponse::PAYLOAD_NOT_SET] = cells;
-      return seen;
+      out.ok = reader->Finish().ok();
+      return out;
     };
-    auto meta_only = kinds(*stub, {pdfv1::PDF_FAMILY_DOC_METADATA});
-    Check(meta_only[pdfv1::ParseResponse::kHeader] == 1 &&
-              meta_only[pdfv1::ParseResponse::kDocMeta] == 1 &&
-              meta_only[pdfv1::ParseResponse::kTrailer] == 1,
+    Carried meta_only = carried(*stub, {pdfv1::PDF_FAMILY_DOC_METADATA});
+    Check(meta_only.ok &&
+              meta_only.messages[pdfv1::ParseResponse::kHeader] == 1 &&
+              meta_only.messages[pdfv1::ParseResponse::kDocMeta] == 1 &&
+              meta_only.messages[pdfv1::ParseResponse::kTrailer] == 1,
           "a metadata-only parse carries the header, metadata and trailer");
-    Check(meta_only[pdfv1::ParseResponse::kPage] == 0 &&
-              meta_only[pdfv1::ParseResponse::kFonts] == 0 &&
-              meta_only[pdfv1::ParseResponse::kAttachment] == 0,
+    Check(meta_only.messages[pdfv1::ParseResponse::kPage] == 0 &&
+              meta_only.messages[pdfv1::ParseResponse::kFonts] == 0 &&
+              meta_only.messages[pdfv1::ParseResponse::kAttachment] == 0,
           "a metadata-only parse sends no page chunks, fonts or attachments");
-    auto text_only = kinds(*stub, {pdfv1::PDF_FAMILY_TEXT_CELLS});
-    Check(text_only[pdfv1::ParseResponse::kPage] == 1 &&
-              text_only[pdfv1::ParseResponse::PAYLOAD_NOT_SET] > 0,
+    Carried text_only = carried(*stub, {pdfv1::PDF_FAMILY_TEXT_CELLS});
+    Check(text_only.ok && text_only.messages[pdfv1::ParseResponse::kPage] == 1 &&
+              text_only.cells > 0,
           "a text-only parse carries the page's cells");
-    Check(text_only[pdfv1::ParseResponse::kFonts] == 0,
-          "a text-only parse sends no font table");
+    Check(text_only.messages[pdfv1::ParseResponse::kFonts] >= 1 &&
+              text_only.dangling_font_ids == 0,
+          "a text-only parse sends each FontRef its cells cite, ahead of them");
   }
 
   // Font names and widget state names are PDF names, raw bytes in the

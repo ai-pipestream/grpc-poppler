@@ -692,7 +692,11 @@ grpc::Status PopplerServiceImpl::Parse(
             bool is_new = false;
             uint32_t id = fonts.Intern(name, &is_new);
             cell->set_font_id(id);
-            if (is_new && want_fonts) {
+            // A cell's font_id must name a FontRef on the stream, so a font
+            // first met here is sent ahead of its page chunk even when the
+            // request did not ask for the document font table, as
+            // grpc-pdfium does.
+            if (is_new) {
               pdfv1::ParseResponse fonts_msg;
               auto* ref = fonts_msg.mutable_fonts()->add_fonts();
               ref->set_font_id(id);
