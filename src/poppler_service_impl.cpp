@@ -25,6 +25,7 @@
 #include "poppler_attachments.h"
 #include "poppler_forms.h"
 #include "sha256.h"
+#include "utf8.h"
 
 namespace grpc_poppler {
 
@@ -603,7 +604,10 @@ grpc::Status PopplerServiceImpl::Parse(
       if (!is_new) continue;
       auto* ref = chunk->add_fonts();
       ref->set_font_id(id);
-      ref->set_base_name(info.name());
+      // Font names are PDF names, raw bytes in whatever encoding the
+      // producer used (GBK and Shift-JIS are common); the ids stay keyed
+      // by the raw name.
+      ref->set_base_name(ValidUtf8(info.name()));
       ref->set_kind(MapFontKind(info.type()));
       ref->set_embedded(info.is_embedded());
     }
@@ -649,7 +653,7 @@ grpc::Status PopplerServiceImpl::Parse(
               pdfv1::ParseResponse fonts_msg;
               auto* ref = fonts_msg.mutable_fonts()->add_fonts();
               ref->set_font_id(id);
-              ref->set_base_name(name);
+              ref->set_base_name(ValidUtf8(name));
               ++counts[pdfv1::PDF_FAMILY_FONTS];
               client_ok = writer->Write(fonts_msg);
               if (!client_ok) break;

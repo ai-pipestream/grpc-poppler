@@ -35,10 +35,11 @@ std::string TextString(const GooString* text) {
 
 // A field value as text: a text string decoded from PDFDocEncoding or
 // UTF-16, a name without its slash (the state name, as PDFium reports a
-// button value), the first entry of a multi-selection array.
+// button value, made valid UTF-8 since a PDF name is raw bytes), the first
+// entry of a multi-selection array.
 std::optional<std::string> ValueText(const Object& value) {
   if (value.isString()) return PdfTextStringToUtf8(value.getString());
-  if (value.isName()) return std::string(value.getName());
+  if (value.isName()) return ValidUtf8(value.getName());
   if (value.isArray()) {
     for (int i = 0; i < value.arrayGetLength(); ++i) {
       const Object entry = value.arrayGet(i, 0);
@@ -111,7 +112,7 @@ void FillField(FormWidget* widget, pdfv1::FormField* field) {
   // /AS belongs to the widget annotation and is never inherited.
   const Object state = object->dictLookup("AS");
   if (state.isName()) {
-    field->set_appearance_state(std::string("/") + state.getName());
+    field->set_appearance_state("/" + ValidUtf8(state.getName()));
   }
 
   double x1 = 0.0;

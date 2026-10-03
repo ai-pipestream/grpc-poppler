@@ -295,6 +295,47 @@ int main(int argc, char** argv) {
           "the trailer warns about the omitted data");
   }
 
+  // Font names and widget state names are PDF names, raw bytes in the
+  // file. encodings.pdf names its font in GBK and gives a check box the
+  // state #E9tat; both arrive as valid UTF-8 (the bytes of an ill-formed
+  // sequence read as Latin-1), so the whole stream still parses.
+  {
+    grpc::ClientContext ctx;
+    SetDeadline(&ctx);
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(encodings);
+    auto reader = stub->Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    std::map<uint32_t, std::string> font_names;
+    std::vector<pdfv1::TextCell> cells;
+    std::vector<pdfv1::FormField> fields;
+    while (reader->Read(&msg)) {
+      if (msg.has_fonts()) {
+        for (const auto& font : msg.fonts().fonts()) {
+          font_names[font.font_id()] = font.base_name();
+        }
+      } else if (msg.has_page()) {
+        for (const auto& cell : msg.page().text_cells()) cells.push_back(cell);
+        for (const auto& f : msg.page().form_fields()) fields.push_back(f);
+      }
+    }
+    Check(reader->Finish().ok(), "encodings.pdf parses to the end");
+    const std::string simsun_latin1 = "\xc3\x8b\xc3\x8e\xc3\x8c\xc3\xa5";
+    bool font_listed = false;
+    for (const auto& [id, name] : font_names) {
+      if (name == simsun_latin1) font_listed = true;
+    }
+    Check(font_listed, "a GBK font name arrives as valid UTF-8");
+    Check(cells.size() == 1 && cells[0].text() == "Hello" &&
+              cells[0].has_font_id() &&
+              font_names[cells[0].font_id()] == simsun_latin1,
+          "the cell drawn in that font points at it");
+    Check(fields.size() == 1 &&
+              fields[0].appearance_state() == "/\xc3\xa9tat" &&
+              fields[0].value() == "\xc3\xa9tat",
+          "a widget state name that is not UTF-8 arrives as valid UTF-8");
+  }
+
   // Page frames. frames.pdf draws one word with its baseline at (100, 700)
   // in user space under every /Rotate and with offset CropBoxes
   // (test/fixtures/make_frames_pdf.py). Geometry comes back in the
