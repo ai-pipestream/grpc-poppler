@@ -109,9 +109,10 @@ inside the server's 520 MiB message limit:
 A page poppler cannot render ends the Render stream with `INTERNAL` naming
 the page, rather than being left out of the stream.
 
-A set `PageRange` must have `end` greater than `begin` and a `begin` below
-2^31 (poppler indexes pages with an int); anything else is
-`INVALID_ARGUMENT`. An `end` past the document stops at its last page.
+A set `PageRange` must have `end` greater than `begin`, the contract's one
+rule for it; anything else is `INVALID_ARGUMENT`. An `end` past the
+document stops at its last page, and a range that starts past it selects
+no page, however large its `begin`.
 
 ## Docker
 

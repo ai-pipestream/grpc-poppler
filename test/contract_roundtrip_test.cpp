@@ -675,9 +675,8 @@ int main(int argc, char** argv) {
           "the stalled render ends cancelled");
   }
 
-  // PageRange is zero-based and half-open. A set range needs end greater
-  // than begin, and a begin of 2^31 or more names no page: such a begin used
-  // to wrap to a negative index and crash the process.
+  // PageRange is zero-based and half-open, and a set range needs end
+  // greater than begin.
   {
     struct BadRange {
       uint32_t begin;
@@ -686,8 +685,6 @@ int main(int argc, char** argv) {
     };
     const std::vector<BadRange> bad_ranges = {
         {4294967295u, 1u, "begin 2^32-1, end 1"},
-        {2147483648u, 4294967295u, "begin 2^31"},
-        {4294967294u, 4294967295u, "begin 2^32-2"},
         {1u, 1u, "end equal to begin"},
         {3u, 2u, "end below begin"},
     };
@@ -734,7 +731,8 @@ int main(int argc, char** argv) {
     }
   }
   // An end past the document is clamped to it, and a begin past it selects
-  // no page.
+  // no page. A begin of 2^31 or more is a valid range too: it used to wrap
+  // to a negative index and crash the process.
   {
     struct GoodRange {
       uint32_t begin;
@@ -747,6 +745,8 @@ int main(int argc, char** argv) {
         {0u, 1u, 1, "the one page"},
         {5u, 9u, 0, "past the last page"},
         {2147483647u, 4294967295u, 0, "begin 2^31-1"},
+        {2147483648u, 4294967295u, 0, "begin 2^31"},
+        {4294967294u, 4294967295u, 0, "begin 2^32-2"},
     };
     for (const GoodRange& good : good_ranges) {
       {

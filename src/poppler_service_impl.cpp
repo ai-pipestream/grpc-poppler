@@ -6,7 +6,6 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -262,26 +261,19 @@ struct PageSpan {
 };
 
 // The contract's PageRange is zero-based and half-open, and a set range
-// must have end greater than begin. Its fields are uint32 while poppler
-// indexes pages with an int, so a begin of 2^31 or more names no page of
-// any document; both are rejected before either can turn into a negative
-// index.
+// must have end greater than begin; that is its only rule. Any other uint32
+// range is valid, and SelectPages clamps it to the document.
 grpc::Status CheckPageRange(const pdfv1::PageRange& range) {
   if (range.end() <= range.begin()) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                         "page range end must be greater than begin");
   }
-  if (range.begin() >
-      static_cast<uint32_t>(std::numeric_limits<int>::max())) {
-    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                        "page range begin " + std::to_string(range.begin()) +
-                            " is not a page index");
-  }
   return grpc::Status::OK;
 }
 
 // The pages a checked range selects, clamped to the document in unsigned
-// space; unset selects every page.
+// space, so a begin of 2^31 or more selects no page rather than turning
+// into a negative index; unset selects every page.
 PageSpan SelectPages(bool has_range, const pdfv1::PageRange& range,
                      int page_count) {
   const uint64_t count = page_count > 0 ? static_cast<uint64_t>(page_count) : 0;
