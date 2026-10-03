@@ -31,6 +31,12 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   maps them back. Anything new that carries geometry lands in the same
   space; `test/fixtures/frames.pdf` pins it for every /Rotate and for offset
   CropBoxes.
+- **The arm64 gate** (`PopplerGate`, `src/poppler_service_impl.cpp`)
+  serializes poppler calls on arm64. A handler holds it while poppler code
+  runs and never across a network write: every stream write goes through
+  `WriteUngated`, so a slow or stalled client cannot hold every other
+  request behind it. Poppler objects are declared after the gate, so they
+  are destroyed with it held. Page loops stop when the call is cancelled.
 - **The content-addressed handshake** (`PdfDocument.sha256`) is served from
   an in-process LRU byte cache (`src/document_cache.h`), resolved once for
   all three RPCs in `ResolveDocumentBytes` (`src/poppler_service_impl.cpp`).

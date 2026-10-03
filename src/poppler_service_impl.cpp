@@ -38,22 +38,45 @@ constexpr char kBackendName[] = "grpc-poppler";
 
 // Mirrors gRParse's arm64 serialization gate: poppler calls crash under
 // concurrency on arm64, so they run one at a time there and concurrently
-// elsewhere.
+// elsewhere. A handler holds the gate from construction to return, and
+// releases it only around a network write (WriteUngated), when no poppler
+// code runs: a client that reads slowly must not hold every other
+// request's poppler work behind it. Poppler objects outlive a release but
+// are only used, and destroyed, with the gate held, so the gate is
+// declared before them.
 #if defined(__aarch64__)
 class PopplerGate {
  public:
   PopplerGate() : lock_(Mutex()) {}
+
+  void Release() { lock_.unlock(); }
+  void Reacquire() { lock_.lock(); }
 
  private:
   static std::mutex& Mutex() {
     static std::mutex m;
     return m;
   }
-  std::lock_guard<std::mutex> lock_;
+  std::unique_lock<std::mutex> lock_;
 };
 #else
-class PopplerGate {};
+class PopplerGate {
+ public:
+  void Release() {}
+  void Reacquire() {}
+};
 #endif
+
+// Writes one stream message with the gate released for the duration of
+// the write, which blocks for as long as the client takes to read.
+template <typename Message>
+bool WriteUngated(PopplerGate& gate, grpc::ServerWriter<Message>* writer,
+                  const Message& message) {
+  gate.Release();
+  const bool written = writer->Write(message);
+  gate.Reacquire();
+  return written;
+}
 
 std::string ToUtf8(const poppler::ustring& s) {
   poppler::byte_array bytes = s.to_utf8();
@@ -451,7 +474,7 @@ grpc::Status PopplerServiceImpl::Probe(grpc::ServerContext* /*context*/,
 }
 
 grpc::Status PopplerServiceImpl::Parse(
-    grpc::ServerContext* /*context*/, const pdfv1::ParseRequest* request,
+    grpc::ServerContext* context, const pdfv1::ParseRequest* request,
     grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
   if (request->has_pages()) {
     if (grpc::Status range = CheckPageRange(request->pages()); !range.ok()) {
@@ -503,7 +526,8 @@ grpc::Status PopplerServiceImpl::Parse(
     crop->set_x1(crop_rect.right());
     crop->set_y1(crop_rect.bottom());
   }
-  if (!writer->Write(header_msg) || loaded.status != pdfv1::LOAD_STATUS_OK) {
+  if (!WriteUngated(gate, writer, header_msg) ||
+      loaded.status != pdfv1::LOAD_STATUS_OK) {
     return grpc::Status::OK;
   }
   bool client_ok = true;
@@ -543,7 +567,7 @@ grpc::Status PopplerServiceImpl::Parse(
                             std::to_string(minor));
     }
     if (loaded.doc->is_linearized()) meta->set_linearized(true);
-    client_ok = writer->Write(msg);
+    client_ok = WriteUngated(gate, writer, msg);
   }
   if (client_ok && loaded.doc->is_encrypted() &&
       WantFamily(*request, pdfv1::PDF_FAMILY_ENCRYPTION_INFO)) {
@@ -560,7 +584,7 @@ grpc::Status PopplerServiceImpl::Parse(
     enc->set_can_assemble(loaded.doc->has_permission(poppler::perm_assemble));
     enc->set_can_print_high_res(
         loaded.doc->has_permission(poppler::perm_print_high_resolution));
-    client_ok = writer->Write(msg);
+    client_ok = WriteUngated(gate, writer, msg);
   }
   if (client_ok && WantFamily(*request, pdfv1::PDF_FAMILY_OUTLINE)) {
     std::unique_ptr<poppler::toc> toc(loaded.doc->create_toc());
@@ -571,7 +595,7 @@ grpc::Status PopplerServiceImpl::Parse(
       for (const poppler::toc_item* item : toc->root()->children()) {
         FillOutlineItem(item, chunk->add_roots(), 0);
       }
-      client_ok = writer->Write(msg);
+      client_ok = WriteUngated(gate, writer, msg);
     }
   }
   // Embedded files come from poppler's core API (src/poppler_attachments.h):
@@ -596,7 +620,7 @@ grpc::Status PopplerServiceImpl::Parse(
           }
           pdfv1::ParseResponse msg;
           *msg.mutable_attachment() = std::move(meta);
-          return writer->Write(msg);
+          return WriteUngated(gate, writer, msg);
         });
   }
 
@@ -619,7 +643,9 @@ grpc::Status PopplerServiceImpl::Parse(
       ref->set_kind(MapFontKind(info.type()));
       ref->set_embedded(info.is_embedded());
     }
-    if (chunk->fonts_size() > 0) client_ok = writer->Write(msg);
+    if (chunk->fonts_size() > 0) {
+      client_ok = WriteUngated(gate, writer, msg);
+    }
   }
 
   const auto [begin, end] =
@@ -637,6 +663,7 @@ grpc::Status PopplerServiceImpl::Parse(
                                  end);
   }
   for (int i = begin; client_ok && i < end; ++i) {
+    if (context->IsCancelled()) return grpc::Status::CANCELLED;
     poppler::page* page = pages[static_cast<size_t>(i)].get();
     if (page == nullptr) continue;
     pdfv1::ParseResponse page_msg;
@@ -663,7 +690,7 @@ grpc::Status PopplerServiceImpl::Parse(
               ref->set_font_id(id);
               ref->set_base_name(ValidUtf8(name));
               ++counts[pdfv1::PDF_FAMILY_FONTS];
-              client_ok = writer->Write(fonts_msg);
+              client_ok = WriteUngated(gate, writer, fonts_msg);
               if (!client_ok) break;
             }
           }
@@ -678,7 +705,7 @@ grpc::Status PopplerServiceImpl::Parse(
         ++counts[pdfv1::PDF_FAMILY_FORM_FIELDS];
       }
     }
-    client_ok = writer->Write(page_msg);
+    client_ok = WriteUngated(gate, writer, page_msg);
   }
   if (!client_ok) return grpc::Status::OK;
 
@@ -692,12 +719,12 @@ grpc::Status PopplerServiceImpl::Parse(
   for (pdfv1::ParseWarning& warning : warnings) {
     *trailer->add_warnings() = std::move(warning);
   }
-  writer->Write(trailer_msg);
+  WriteUngated(gate, writer, trailer_msg);
   return grpc::Status::OK;
 }
 
 grpc::Status PopplerServiceImpl::Render(
-    grpc::ServerContext* /*context*/, const pdfv1::RenderRequest* request,
+    grpc::ServerContext* context, const pdfv1::RenderRequest* request,
     grpc::ServerWriter<pdfv1::RenderResponse>* writer) {
   // dpi sizes the raster splash allocates, so NaN and infinity are refused
   // along with zero and negative values, and so is a dpi above the cap;
@@ -737,7 +764,7 @@ grpc::Status PopplerServiceImpl::Render(
     auto* head = head_msg.mutable_head();
     head->set_load_status(loaded.status);
     if (!loaded.detail.empty()) head->set_load_detail(loaded.detail);
-    writer->Write(head_msg);
+    WriteUngated(gate, writer, head_msg);
     return grpc::Status::OK;
   }
 
@@ -747,39 +774,45 @@ grpc::Status PopplerServiceImpl::Render(
   poppler::page_renderer renderer;
   renderer.set_image_format(poppler::image::format_bgr24);
   for (int i = begin; i < end; ++i) {
-    std::unique_ptr<poppler::page> page(loaded.doc->create_page(i));
-    if (page == nullptr) continue;
-    // The raster's size is known before splash allocates it: the CropBox
-    // at the requested dpi (rounded up here; splash rounds to nearest).
-    const poppler::rectf box = page->page_rect();
-    const double scale = dpi / 72.0;
-    const double pixels =
-        std::ceil(box.width() * scale) * std::ceil(box.height() * scale);
-    if (pixels > static_cast<double>(limits_.max_raster_pixels)) {
-      return grpc::Status(
-          grpc::StatusCode::RESOURCE_EXHAUSTED,
-          "page " + std::to_string(i) + " at " + FormatNumber(dpi) +
-              " dpi would be " + FormatNumber(pixels) +
-              " pixels, above the limit of " +
-              std::to_string(limits_.max_raster_pixels));
-    }
-    const poppler::image image = renderer.render_page(page.get(), dpi, dpi);
-    if (!image.is_valid()) {
-      return grpc::Status(grpc::StatusCode::INTERNAL,
-                          "poppler could not render page " + std::to_string(i));
-    }
+    if (context->IsCancelled()) return grpc::Status::CANCELLED;
     pdfv1::RenderResponse msg;
-    auto* raster = msg.mutable_raster();
-    raster->set_page_index(static_cast<uint32_t>(i));
-    raster->set_width_px(static_cast<uint32_t>(image.width()));
-    raster->set_height_px(static_cast<uint32_t>(image.height()));
-    raster->set_stride_bytes(static_cast<uint32_t>(image.bytes_per_row()));
-    raster->set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
-    raster->set_dpi(dpi);
-    raster->set_pixels(image.const_data(),
-                       static_cast<size_t>(image.bytes_per_row()) *
-                           image.height());
-    if (!writer->Write(msg)) return grpc::Status::OK;
+    {
+      // The page and its image are freed here, under the gate, before the
+      // write; the message holds the only copy of the pixels on the wire.
+      std::unique_ptr<poppler::page> page(loaded.doc->create_page(i));
+      if (page == nullptr) continue;
+      // The raster's size is known before splash allocates it: the CropBox
+      // at the requested dpi (rounded up here; splash rounds to nearest).
+      const poppler::rectf box = page->page_rect();
+      const double scale = dpi / 72.0;
+      const double pixels =
+          std::ceil(box.width() * scale) * std::ceil(box.height() * scale);
+      if (pixels > static_cast<double>(limits_.max_raster_pixels)) {
+        return grpc::Status(
+            grpc::StatusCode::RESOURCE_EXHAUSTED,
+            "page " + std::to_string(i) + " at " + FormatNumber(dpi) +
+                " dpi would be " + FormatNumber(pixels) +
+                " pixels, above the limit of " +
+                std::to_string(limits_.max_raster_pixels));
+      }
+      const poppler::image image = renderer.render_page(page.get(), dpi, dpi);
+      if (!image.is_valid()) {
+        return grpc::Status(
+            grpc::StatusCode::INTERNAL,
+            "poppler could not render page " + std::to_string(i));
+      }
+      auto* raster = msg.mutable_raster();
+      raster->set_page_index(static_cast<uint32_t>(i));
+      raster->set_width_px(static_cast<uint32_t>(image.width()));
+      raster->set_height_px(static_cast<uint32_t>(image.height()));
+      raster->set_stride_bytes(static_cast<uint32_t>(image.bytes_per_row()));
+      raster->set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
+      raster->set_dpi(dpi);
+      raster->set_pixels(image.const_data(),
+                         static_cast<size_t>(image.bytes_per_row()) *
+                             image.height());
+    }
+    if (!WriteUngated(gate, writer, msg)) return grpc::Status::OK;
   }
   return grpc::Status::OK;
 }

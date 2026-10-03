@@ -12,6 +12,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
@@ -539,6 +540,56 @@ int main(int argc, char** argv) {
                   grpc::StatusCode::INVALID_ARGUMENT &&
               rasters == 0,
           "a dpi above the service's maximum is INVALID_ARGUMENT");
+  }
+
+  // A client that stops reading must not stall the service. On arm64, where
+  // poppler calls run one at a time behind a process-wide gate, the gate
+  // is released while a write waits on the client. A render of frames.pdf
+  // at 300 dpi (25 MB a page) is left unread after its first raster, and a
+  // probe on a connection of its own must still be answered; the stalled
+  // render then ends cancelled.
+  {
+    grpc::ChannelArguments render_args;
+    render_args.SetMaxReceiveMessageSize(-1);
+    auto render_stub =
+        pdfv1::PdfBackendService::NewStub(grpc::CreateCustomChannel(
+            "127.0.0.1:" + std::to_string(port),
+            grpc::InsecureChannelCredentials(), render_args));
+    grpc::ClientContext render_ctx;
+    SetDeadline(&render_ctx);
+    pdfv1::RenderRequest request;
+    request.mutable_document()->set_data(frames);
+    request.set_dpi(300.0);
+    request.set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
+    auto stalled = render_stub->Render(&render_ctx, request);
+    pdfv1::RenderResponse raster_msg;
+    Check(stalled->Read(&raster_msg) && raster_msg.has_raster(),
+          "the render to be stalled sends its first raster");
+    // Time for the server to render the next page and block writing it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    grpc::ChannelArguments probe_args;
+    probe_args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
+    auto probe_stub =
+        pdfv1::PdfBackendService::NewStub(grpc::CreateCustomChannel(
+            "127.0.0.1:" + std::to_string(port),
+            grpc::InsecureChannelCredentials(), probe_args));
+    grpc::ClientContext probe_ctx;
+    probe_ctx.set_deadline(std::chrono::system_clock::now() +
+                           std::chrono::seconds(20));
+    pdfv1::ProbeRequest probe;
+    probe.mutable_document()->set_data(hello);
+    pdfv1::ProbeResponse probe_response;
+    Check(probe_stub->Probe(&probe_ctx, probe, &probe_response).ok() &&
+              probe_response.capabilities().load_status() ==
+                  pdfv1::LOAD_STATUS_OK,
+          "a probe is answered while another client stalls a render");
+
+    render_ctx.TryCancel();
+    while (stalled->Read(&raster_msg)) {
+    }
+    Check(stalled->Finish().error_code() == grpc::StatusCode::CANCELLED,
+          "the stalled render ends cancelled");
   }
 
   // PageRange is zero-based and half-open. A set range needs end greater
