@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Regenerates frames.pdf, the page-frame fixture: ten Letter pages that
 draw the same Helvetica 24pt word "Frame" with its baseline at (100, 700)
 in PDF user space, under every /Rotate value and with offset CropBoxes, so

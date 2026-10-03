@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "document_cache.h"
 
 namespace grpc_poppler {

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Contract test for grpc-poppler: the tier 0 floor plus the cpp-surface
 // document families (metadata with XMP, outline, attachments, fonts) over
 // the hello.pdf and rich.pdf fixtures.

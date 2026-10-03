@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Regenerates rich.pdf, the tier 1-2 fixture: one Letter page carrying
 document metadata, a two-item outline, a URI link and a goto link, a
 highlight and a sticky-note annotation, a text form field, a check box

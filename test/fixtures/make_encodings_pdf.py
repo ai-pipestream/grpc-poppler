@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Regenerates encodings.pdf, the string-encoding fixture: names that are
 not UTF-8 in the file, which must still reach the client as valid UTF-8
 (protobuf rejects a message whose string field is not, and the client then

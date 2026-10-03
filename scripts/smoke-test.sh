@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Boot-proofs a grpc-poppler image: a green build is not "done" until the
 # artifact starts under the flags it ships with. Hermetic (no documents, no
 # network beyond the docker socket), so it runs in CI and before any push.
