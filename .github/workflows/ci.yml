@@ -10,7 +10,14 @@ permissions:
 
 jobs:
   image:
-    runs-on: ubuntu-latest
+    name: image ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    # Both architectures the publish workflow ships, each built natively.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
       - name: Build the image and run the test suite
@@ -18,7 +25,10 @@ jobs:
         # the tests pass; building the full image (not just the build stage)
         # also assembles the runtime stage, so a runtime library missing
         # from the staged closure fails here instead of at deploy time.
-        run: docker build --progress=plain -t grpc-poppler:ci .
+        # The hosted arm runner has 4 cores, matching the publish leg.
+        run: >-
+          docker build --progress=plain -t grpc-poppler:ci
+          --build-arg GRPC_POPPLER_BUILD_JOBS=${{ matrix.runner == 'ubuntu-24.04-arm' && 4 || 8 }} .
       - name: Boot-proof the runtime image
         # Library closure, boot to listening under the hardened run flags,
         # uid 65532.
