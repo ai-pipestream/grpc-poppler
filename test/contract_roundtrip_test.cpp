@@ -112,9 +112,14 @@ int main(int argc, char** argv) {
   tight_builder.RegisterService(&tight_service);
   std::unique_ptr<grpc::Server> tight_server = tight_builder.BuildAndStart();
   Check(tight_server != nullptr && tight_port != 0, "tight-limit server up");
-  auto tight_stub = pdfv1::PdfBackendService::NewStub(
-      grpc::CreateChannel("127.0.0.1:" + std::to_string(tight_port),
-                          grpc::InsecureChannelCredentials()));
+  // No receive limit on this client: a raster the service should have
+  // refused must arrive and fail the check, not trip the client's default
+  // 4 MiB limit, which is RESOURCE_EXHAUSTED too.
+  grpc::ChannelArguments tight_args;
+  tight_args.SetMaxReceiveMessageSize(-1);
+  auto tight_stub = pdfv1::PdfBackendService::NewStub(grpc::CreateCustomChannel(
+      "127.0.0.1:" + std::to_string(tight_port),
+      grpc::InsecureChannelCredentials(), tight_args));
 
   {
     grpc::ClientContext ctx;
@@ -689,6 +694,7 @@ int main(int argc, char** argv) {
     for (const BadRange& bad : bad_ranges) {
       {
         grpc::ClientContext ctx;
+        SetDeadline(&ctx);
         pdfv1::ParseRequest request;
         request.mutable_document()->set_data(hello);
         request.mutable_pages()->set_begin(bad.begin);
@@ -697,12 +703,17 @@ int main(int argc, char** argv) {
         pdfv1::ParseResponse msg;
         Check(!reader->Read(&msg),
               ("parse sends nothing for " + bad.name).c_str());
+        // Drain whatever a regression sends: Finish waits for an unread
+        // stream.
+        while (reader->Read(&msg)) {
+        }
         Check(reader->Finish().error_code() ==
                   grpc::StatusCode::INVALID_ARGUMENT,
               ("parse range " + bad.name + " is INVALID_ARGUMENT").c_str());
       }
       {
         grpc::ClientContext ctx;
+        SetDeadline(&ctx);
         pdfv1::RenderRequest request;
         request.mutable_document()->set_data(hello);
         request.set_dpi(72.0);
@@ -712,6 +723,10 @@ int main(int argc, char** argv) {
         pdfv1::RenderResponse msg;
         Check(!reader->Read(&msg),
               ("render sends nothing for " + bad.name).c_str());
+        // Drain whatever a regression sends: Finish waits for an unread
+        // stream.
+        while (reader->Read(&msg)) {
+        }
         Check(reader->Finish().error_code() ==
                   grpc::StatusCode::INVALID_ARGUMENT,
               ("render range " + bad.name + " is INVALID_ARGUMENT").c_str());
@@ -736,6 +751,7 @@ int main(int argc, char** argv) {
     for (const GoodRange& good : good_ranges) {
       {
         grpc::ClientContext ctx;
+        SetDeadline(&ctx);
         pdfv1::ParseRequest request;
         request.mutable_document()->set_data(hello);
         request.mutable_pages()->set_begin(good.begin);
@@ -755,6 +771,7 @@ int main(int argc, char** argv) {
       }
       {
         grpc::ClientContext ctx;
+        SetDeadline(&ctx);
         pdfv1::RenderRequest request;
         request.mutable_document()->set_data(hello);
         request.set_dpi(36.0);
