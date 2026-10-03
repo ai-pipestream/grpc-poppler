@@ -2,6 +2,7 @@
 // document families (metadata with XMP, outline, attachments, fonts) over
 // the hello.pdf and rich.pdf fixtures.
 
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -205,6 +206,110 @@ int main(int argc, char** argv) {
     }
     Check(has_ink, "raster has non-white pixels");
     Check(reader->Finish().ok(), "render finished OK");
+  }
+
+  // PageRange is zero-based and half-open. A set range needs end greater
+  // than begin, and a begin of 2^31 or more names no page: such a begin used
+  // to wrap to a negative index and crash the process.
+  {
+    struct BadRange {
+      uint32_t begin;
+      uint32_t end;
+      std::string name;
+    };
+    const std::vector<BadRange> bad_ranges = {
+        {4294967295u, 1u, "begin 2^32-1, end 1"},
+        {2147483648u, 4294967295u, "begin 2^31"},
+        {4294967294u, 4294967295u, "begin 2^32-2"},
+        {1u, 1u, "end equal to begin"},
+        {3u, 2u, "end below begin"},
+    };
+    for (const BadRange& bad : bad_ranges) {
+      {
+        grpc::ClientContext ctx;
+        pdfv1::ParseRequest request;
+        request.mutable_document()->set_data(hello);
+        request.mutable_pages()->set_begin(bad.begin);
+        request.mutable_pages()->set_end(bad.end);
+        auto reader = stub->Parse(&ctx, request);
+        pdfv1::ParseResponse msg;
+        Check(!reader->Read(&msg),
+              ("parse sends nothing for " + bad.name).c_str());
+        Check(reader->Finish().error_code() ==
+                  grpc::StatusCode::INVALID_ARGUMENT,
+              ("parse range " + bad.name + " is INVALID_ARGUMENT").c_str());
+      }
+      {
+        grpc::ClientContext ctx;
+        pdfv1::RenderRequest request;
+        request.mutable_document()->set_data(hello);
+        request.set_dpi(72.0);
+        request.mutable_pages()->set_begin(bad.begin);
+        request.mutable_pages()->set_end(bad.end);
+        auto reader = stub->Render(&ctx, request);
+        pdfv1::RenderResponse msg;
+        Check(!reader->Read(&msg),
+              ("render sends nothing for " + bad.name).c_str());
+        Check(reader->Finish().error_code() ==
+                  grpc::StatusCode::INVALID_ARGUMENT,
+              ("render range " + bad.name + " is INVALID_ARGUMENT").c_str());
+      }
+    }
+  }
+  // An end past the document is clamped to it, and a begin past it selects
+  // no page.
+  {
+    struct GoodRange {
+      uint32_t begin;
+      uint32_t end;
+      size_t pages;
+      std::string name;
+    };
+    const std::vector<GoodRange> good_ranges = {
+        {0u, 4294967295u, 1, "end 2^32-1"},
+        {0u, 1u, 1, "the one page"},
+        {5u, 9u, 0, "past the last page"},
+        {2147483647u, 4294967295u, 0, "begin 2^31-1"},
+    };
+    for (const GoodRange& good : good_ranges) {
+      {
+        grpc::ClientContext ctx;
+        pdfv1::ParseRequest request;
+        request.mutable_document()->set_data(hello);
+        request.mutable_pages()->set_begin(good.begin);
+        request.mutable_pages()->set_end(good.end);
+        auto reader = stub->Parse(&ctx, request);
+        pdfv1::ParseResponse msg;
+        size_t pages = 0;
+        bool saw_trailer = false;
+        while (reader->Read(&msg)) {
+          if (msg.has_page()) ++pages;
+          if (msg.has_trailer()) saw_trailer = true;
+        }
+        Check(reader->Finish().ok() && saw_trailer,
+              ("parse range " + good.name + " finishes OK").c_str());
+        Check(pages == good.pages,
+              ("parse range " + good.name + " selects its pages").c_str());
+      }
+      {
+        grpc::ClientContext ctx;
+        pdfv1::RenderRequest request;
+        request.mutable_document()->set_data(hello);
+        request.set_dpi(36.0);
+        request.mutable_pages()->set_begin(good.begin);
+        request.mutable_pages()->set_end(good.end);
+        auto reader = stub->Render(&ctx, request);
+        pdfv1::RenderResponse msg;
+        size_t rasters = 0;
+        while (reader->Read(&msg)) {
+          if (msg.has_raster()) ++rasters;
+        }
+        Check(reader->Finish().ok(),
+              ("render range " + good.name + " finishes OK").c_str());
+        Check(rasters == good.pages,
+              ("render range " + good.name + " selects its pages").c_str());
+      }
+    }
   }
 
   // The content-addressed handshake (PdfDocument.sha256).

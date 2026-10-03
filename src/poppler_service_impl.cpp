@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -209,6 +211,42 @@ bool WantFamily(const pdfv1::ParseRequest& request, pdfv1::PdfFamily family) {
                    family) != request.families().end();
 }
 
+// Pages [begin, end) of a request, as engine page indexes.
+struct PageSpan {
+  int begin = 0;
+  int end = 0;
+};
+
+// The contract's PageRange is zero-based and half-open, and a set range
+// must have end greater than begin. Its fields are uint32 while poppler
+// indexes pages with an int, so a begin of 2^31 or more names no page of
+// any document; both are rejected before either can turn into a negative
+// index.
+grpc::Status CheckPageRange(const pdfv1::PageRange& range) {
+  if (range.end() <= range.begin()) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                        "page range end must be greater than begin");
+  }
+  if (range.begin() >
+      static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                        "page range begin " + std::to_string(range.begin()) +
+                            " is not a page index");
+  }
+  return grpc::Status::OK;
+}
+
+// The pages a checked range selects, clamped to the document in unsigned
+// space; unset selects every page.
+PageSpan SelectPages(bool has_range, const pdfv1::PageRange& range,
+                     int page_count) {
+  const uint64_t count = page_count > 0 ? static_cast<uint64_t>(page_count) : 0;
+  if (!has_range) return {0, static_cast<int>(count)};
+  const uint64_t begin = std::min<uint64_t>(range.begin(), count);
+  const uint64_t end = std::max(begin, std::min<uint64_t>(range.end(), count));
+  return {static_cast<int>(begin), static_cast<int>(end)};
+}
+
 bool IsQuarterTurn(const poppler::page& page) {
   const auto orientation = page.orientation();
   return orientation == poppler::page::landscape ||
@@ -289,6 +327,11 @@ grpc::Status PopplerServiceImpl::Probe(grpc::ServerContext* /*context*/,
 grpc::Status PopplerServiceImpl::Parse(
     grpc::ServerContext* /*context*/, const pdfv1::ParseRequest* request,
     grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
+  if (request->has_pages()) {
+    if (grpc::Status range = CheckPageRange(request->pages()); !range.ok()) {
+      return range;
+    }
+  }
   const ResolvedBytes resolved = ResolveDocumentBytes(request->document(), cache_);
   if (resolved.invalid_argument) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
@@ -446,13 +489,8 @@ grpc::Status PopplerServiceImpl::Parse(
     if (chunk->fonts_size() > 0) client_ok = writer->Write(msg);
   }
 
-  int begin = 0;
-  int end = page_count;
-  if (request->has_pages()) {
-    begin =
-        std::min<int>(static_cast<int>(request->pages().begin()), page_count);
-    end = std::min<int>(static_cast<int>(request->pages().end()), page_count);
-  }
+  const auto [begin, end] =
+      SelectPages(request->has_pages(), request->pages(), page_count);
 
   std::map<pdfv1::PdfFamily, uint64_t> counts;
   counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] = static_cast<uint64_t>(page_count);
@@ -550,6 +588,11 @@ grpc::Status PopplerServiceImpl::Render(
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                         "dpi must be positive");
   }
+  if (request->has_pages()) {
+    if (grpc::Status range = CheckPageRange(request->pages()); !range.ok()) {
+      return range;
+    }
+  }
   const ResolvedBytes resolved = ResolveDocumentBytes(request->document(), cache_);
   if (resolved.invalid_argument) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
@@ -573,14 +616,8 @@ grpc::Status PopplerServiceImpl::Render(
     return grpc::Status::OK;
   }
 
-  const int page_count = loaded.doc->pages();
-  int begin = 0;
-  int end = page_count;
-  if (request->has_pages()) {
-    begin =
-        std::min<int>(static_cast<int>(request->pages().begin()), page_count);
-    end = std::min<int>(static_cast<int>(request->pages().end()), page_count);
-  }
+  const auto [begin, end] = SelectPages(request->has_pages(), request->pages(),
+                                        loaded.doc->pages());
 
   poppler::page_renderer renderer;
   renderer.set_image_format(poppler::image::format_bgr24);
