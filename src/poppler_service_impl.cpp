@@ -644,10 +644,15 @@ grpc::Status PopplerServiceImpl::Parse(
                    " has no readable embedded file stream; its data is "
                    "omitted");
               break;
+            case AttachmentData::kUndecodable:
+              warn(quoted +
+                   " has an embedded file stream poppler cannot start to "
+                   "decode; its data is omitted");
+              break;
             case AttachmentData::kIncluded:
-              // poppler ends a stream it cannot decode as if at its end, so
-              // a length that differs from the declared /Params /Size is the
-              // one sign of a damaged or misdeclared file.
+              // poppler ends a stream it stops decoding part way as if at its
+              // end, so a length that differs from the declared /Params /Size
+              // is the one sign of a damaged or misdeclared file.
               if (meta.has_size_bytes() &&
                   meta.data().size() != meta.size_bytes()) {
                 warn(quoted + " decodes to " +

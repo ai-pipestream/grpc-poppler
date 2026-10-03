@@ -21,6 +21,10 @@ enum class AttachmentData {
   kOverLimit,
   // The file spec carries no readable embedded stream; data is left unset.
   kUnavailable,
+  // The embedded stream is there but its decoder refuses to start (poppler
+  // checks a FlateDecode stream's zlib header when it rewinds the stream);
+  // data is left unset.
+  kUndecodable,
 };
 
 // How a ReadAttachments call ended.
@@ -46,8 +50,9 @@ enum class AttachmentsRead {
 // the MIME type (the stream's /Subtype name) is made valid UTF-8, and with
 // max_data_bytes set the bytes are decoded block by block and dropped once
 // they pass the cap, so a stream that inflates without bound costs at most
-// the cap plus one block. A stream poppler cannot decode ends early, as
-// at its end; the caller compares the bytes with the declared size.
+// the cap plus one block. A stream whose decoder will not start is
+// kUndecodable; one poppler stops decoding part way ends early, as at its
+// end, so the caller compares the bytes with the declared size.
 AttachmentsRead ReadAttachments(
     const std::string& data, const std::optional<std::string>& password,
     std::optional<uint64_t> max_data_bytes,

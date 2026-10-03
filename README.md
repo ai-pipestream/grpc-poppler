@@ -115,10 +115,11 @@ trailer carries a `ParseWarning` with its `page_index`.
 
 An attachment whose data was asked for but cannot be had is still listed,
 and the trailer says why in a `ParseWarning`: its data passes the cap
-above, its file spec has no readable embedded stream, or the bytes it
-decodes to differ from its declared `/Params /Size` (poppler ends a stream
-it cannot decode as if at its end, so the mismatch is the one sign of
-damage). If poppler's core API cannot open the document at all, no
+above, its file spec has no readable embedded stream, its stream's
+decoder will not start (a FlateDecode stream without a zlib header), or
+the bytes it decodes to differ from its declared `/Params /Size` (poppler
+ends a stream it stops decoding part way as if at its end, so the mismatch
+is the one sign of that damage). If poppler's core API cannot open the document at all, no
 attachment is listed and a warning says so.
 
 A set `PageRange` must have `end` greater than `begin`, the contract's one

@@ -350,9 +350,13 @@ int main(int argc, char** argv) {
     std::vector<pdfv1::ParseWarning> warnings;
     Check(parse_attachments(*stub, damaged_attachments, &found, &warnings),
           "damaged_attachments.pdf attachments stream finishes OK");
-    Check(found.size() == 2, "both damaged attachments are listed");
+    Check(found.size() == 3, "all three damaged attachments are listed");
     Check(found.count("lost.txt") == 1 && !found["lost.txt"].has_data(),
           "an attachment without an embedded stream has no data");
+    Check(found.count("garbage.bin") == 1 && !found["garbage.bin"].has_data(),
+          "an attachment whose decoder will not start has no data");
+    Check(found.count("short.bin") == 1 && found["short.bin"].data() == "ab",
+          "a stream poppler stops decoding part way keeps what it decoded");
     auto warned = [&warnings](const std::string& name, const std::string& why) {
       for (const auto& warning : warnings) {
         if (warning.family() == pdfv1::PDF_FAMILY_ATTACHMENTS &&
@@ -363,9 +367,11 @@ int main(int argc, char** argv) {
       }
       return false;
     };
-    Check(warnings.size() == 2, "one warning for each damaged attachment");
-    Check(warned("garbage.bin", "/Size 5"),
+    Check(warnings.size() == 3, "one warning for each damaged attachment");
+    Check(warned("short.bin", "decodes to 2 bytes but declares /Params /Size 5"),
           "a stream that decodes short of its declared size is warned about");
+    Check(warned("garbage.bin", "cannot start to decode"),
+          "a stream whose decoder will not start is warned about");
     Check(warned("lost.txt", "no readable embedded file stream"),
           "an attachment without an embedded stream is warned about");
   }

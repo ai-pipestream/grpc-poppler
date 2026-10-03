@@ -30,9 +30,9 @@ std::string TextString(const GooString* text) {
 }
 
 // Decodes an embedded file stream into *out. False, with *out cleared, once
-// the bytes pass max_bytes; reading stops there. poppler's decoders report
-// a damaged stream only by ending it, so a true return does not prove the
-// bytes whole.
+// the bytes pass max_bytes; reading stops there. Once a stream has
+// rewound, poppler's decoders report damage only by ending it, so a true
+// return does not prove the bytes whole.
 bool ReadCapped(Stream* stream, uint64_t max_bytes, std::string* out) {
   unsigned char block[64 * 1024];
   for (;;) {
@@ -94,9 +94,13 @@ AttachmentsRead ReadAttachments(
         meta.set_mime_type(ValidUtf8(mime->toStr()));
       }
       Stream* stream = file->stream();
-      if (max_data_bytes.has_value() && stream != nullptr && stream->rewind()) {
-        std::string bytes;
-        if (ReadCapped(stream, *max_data_bytes, &bytes)) {
+      if (max_data_bytes.has_value() && stream != nullptr) {
+        // rewind() is where a FlateDecode stream reads its zlib header; one
+        // it does not recognise fails here, before a byte is decoded.
+        if (!stream->rewind()) {
+          outcome = AttachmentData::kUndecodable;
+        } else if (std::string bytes;
+                   ReadCapped(stream, *max_data_bytes, &bytes)) {
           meta.set_data(std::move(bytes));
           outcome = AttachmentData::kIncluded;
         } else {
