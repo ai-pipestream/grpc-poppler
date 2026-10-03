@@ -33,7 +33,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Poppler from the pinned tarball, the same version and option set as
 # gRParse's own images so the two poppler paths stay comparable to the
-# pixel. Only the cpp frontend and the splash renderer are built.
+# pixel. Only the cpp frontend and the splash renderer are built. The core
+# headers are installed too (ENABLE_UNSTABLE_API_ABI_HEADERS): the AcroForm
+# widgets are read through the core API, which the cpp frontend does not
+# wrap. Installing headers leaves the library itself unchanged.
 ARG POPPLER_VERSION=26.08.0
 ARG POPPLER_SHA256=dc906e68cea698109706ac6aa3d2c9d4512fcfcac42d90b8afcda486d1b9abd0
 RUN curl -fsSL -o /tmp/poppler.tar.xz "https://poppler.freedesktop.org/poppler-${POPPLER_VERSION}.tar.xz" \
@@ -45,6 +48,7 @@ RUN curl -fsSL -o /tmp/poppler.tar.xz "https://poppler.freedesktop.org/poppler-$
       -DENABLE_BOOST=ON -DENABLE_NSS3=OFF -DENABLE_GPGME=OFF -DENABLE_LIBCURL=OFF \
       -DENABLE_LIBTIFF=OFF -DENABLE_LIBOPENJPEG=openjpeg2 -DBUILD_CPP_TESTS=OFF \
       -DBUILD_GTK_TESTS=OFF -DBUILD_QT5_TESTS=OFF -DBUILD_QT6_TESTS=OFF -DBUILD_MANUAL_TESTS=OFF \
+      -DENABLE_UNSTABLE_API_ABI_HEADERS=ON \
  && cmake --build /tmp/poppler-build --parallel 4 \
  && cmake --install /tmp/poppler-build \
  && rm -rf /tmp/poppler.tar.xz "/tmp/poppler-${POPPLER_VERSION}" /tmp/poppler-build
