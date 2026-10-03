@@ -2,7 +2,10 @@
 
 // Contract test for grpc-poppler: the tier 0 floor plus the cpp-surface
 // document families (metadata with XMP, outline, attachments, fonts) over
-// the hello.pdf and rich.pdf fixtures.
+// the hello.pdf and rich.pdf fixtures, the page frame on rotated and
+// cropped pages (frames.pdf), names that are not UTF-8 in the file and a
+// decode cap (encodings.pdf), page ranges, Render bounds, and the arm64
+// gate under a stalled client.
 
 #include <chrono>
 #include <cmath>
