@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.27
+# syntax=docker/dockerfile:1.28
 # SPDX-License-Identifier: GPL-3.0-or-later
 # GPL-3.0-or-later image: links Poppler. Off the default release path;
 # built only for the differential profile. This service is the
