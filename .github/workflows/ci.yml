@@ -10,16 +10,22 @@ permissions:
 
 jobs:
   image:
-    name: image ${{ matrix.runner }}
-    runs-on: ${{ matrix.runner }}
+    name: image ${{ matrix.arch }}
+    # GitHub has native arm64 runners. Forgejo has none, so its arm64 entry
+    # builds and boots the image under QEMU on an x64 runner.
+    runs-on: ${{ matrix.arch == 'arm64' && github.server_url == 'https://github.com' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     # Both architectures the publish workflow ships, each built natively.
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Log in to Docker Hardened Images (dhi.io)
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -33,8 +39,9 @@ jobs:
         # from the staged closure fails here instead of at deploy time.
         # The hosted arm runner has 4 cores, matching the publish leg.
         run: >-
-          docker build --progress=plain -t grpc-poppler:ci
-          --build-arg GRPC_POPPLER_BUILD_JOBS=${{ matrix.runner == 'ubuntu-24.04-arm' && 4 || 8 }} .
+          docker buildx build --load --platform linux/${{ matrix.arch }}
+          --progress=plain -t grpc-poppler:ci
+          --build-arg GRPC_POPPLER_BUILD_JOBS=${{ matrix.arch == 'arm64' && 4 || 8 }} .
       - name: Boot-proof the runtime image
         # Library closure, boot to listening under the hardened run flags,
         # uid 65532.
