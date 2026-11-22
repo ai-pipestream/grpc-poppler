@@ -27,6 +27,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include "parse_stream_checks.h"
 #include "poppler_attachments.h"
 #include "poppler_service_impl.h"
 #include "sha256.h"
@@ -1131,6 +1132,33 @@ int main(int argc, char** argv) {
             "the newest document survives eviction");
     }
     tiny_server->Shutdown();
+  }
+
+  // ParseStream: chunked upload, the open's parse, ParsePages and
+  // RenderPages on the same stream, cancel, the hash check, and the
+  // protocol's refusals. A verified upload is cached, so a client that
+  // falls back to the unary RPCs can address it by hash.
+  {
+    grpc_poppler::PopplerServiceImpl fresh_service;
+    grpc::ServerBuilder fresh_builder;
+    int fresh_port = 0;
+    fresh_builder.AddListeningPort("127.0.0.1:0",
+                                   grpc::InsecureServerCredentials(), &fresh_port);
+    fresh_builder.RegisterService(&fresh_service);
+    std::unique_ptr<grpc::Server> fresh_server = fresh_builder.BuildAndStart();
+    auto fresh_stub = pdfv1::PdfBackendService::NewStub(grpc::CreateChannel(
+        "127.0.0.1:" + std::to_string(fresh_port),
+        grpc::InsecureChannelCredentials()));
+    parse_stream_checks::CheckAll(fresh_stub.get(), hello, hello_hash, Check);
+    grpc::ClientContext ctx;
+    SetDeadline(&ctx);
+    pdfv1::ProbeRequest request;
+    request.mutable_document()->set_sha256(hello_hash);
+    pdfv1::ProbeResponse response;
+    Check(fresh_stub->Probe(&ctx, request, &response).ok() &&
+              response.capabilities().load_status() == pdfv1::LOAD_STATUS_OK,
+          "a ParseStream upload is cached for Probe by hash");
+    fresh_server->Shutdown();
   }
 
   tight_server->Shutdown();

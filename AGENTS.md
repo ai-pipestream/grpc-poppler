@@ -48,6 +48,12 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   and `GRPC_POPPLER_CACHE_MAX_BYTES` (default 2 GiB). SHA-256 is boringssl's
   `SHA256` (`src/sha256.cpp`), linked from the `crypto` target gRPC already
   builds; do not add another crypto dependency.
+- `ParseStream` (bidi) lives in `src/parse_stream_session.*`: the session
+  assembles the chunked upload once and serves the open, `ParsePages` and
+  `RenderPages` through the same `ParseTo`/`RenderTo` bodies as `Parse` and
+  `Render` (the unary RPCs wrap their `ServerWriter` in a `MessageSink`), on
+  the stream's bytes, up to three requests of one stream at once. Uploads are
+  capped at 2 GiB; a verified upload goes into the document cache.
 - **Default port is 50071** (`GRPC_POPPLER_PORT` overrides). The PDF backend
   fleet owns 50069 (grpc-pdfium), 50070 (grpc-qparse), 50071 (grpc-poppler);
   the 50051 to 50053 defaults these services started with collide with
