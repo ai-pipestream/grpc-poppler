@@ -71,7 +71,7 @@ class PopplerGate {
 // Writes one stream message with the gate released for the duration of
 // the write, which blocks for as long as the client takes to read.
 template <typename Message>
-bool WriteUngated(PopplerGate& gate, grpc::ServerWriter<Message>* writer,
+bool WriteUngated(PopplerGate& gate, MessageSink<Message>* writer,
                   const Message& message) {
   gate.Release();
   const bool written = writer->Write(message);
@@ -158,6 +158,25 @@ ResolvedBytes ResolveDocumentBytes(const pdfv1::PdfDocument& document,
     return out;
   }
   cache.Insert(document.sha256(), document.data());
+  return out;
+}
+
+// The largest ParseStream upload accepted: the document cache's default
+// byte ceiling. Unlike a unary request, a stream is not held to the
+// 520 MiB message limit, which bounds each chunk instead.
+constexpr uint64_t kMaxStreamDocumentBytes = 2ull * 1024 * 1024 * 1024;
+
+// How many of one ParseStream's requests run at once. Each loads its own
+// poppler document over the shared bytes (the arm64 gate still serializes
+// poppler code), so a client rendering a few pages in parallel keeps the
+// parallelism it had with separate Render calls.
+constexpr unsigned kStreamParallelRequests = 3;
+
+// A ParseStream's upload: complete, and checked against the open's sha256
+// by the session already.
+ResolvedBytes StreamBytes(const std::string* bytes) {
+  ResolvedBytes out;
+  out.bytes = bytes;
   return out;
 }
 
@@ -474,12 +493,22 @@ grpc::Status PopplerServiceImpl::Probe(grpc::ServerContext* /*context*/,
 grpc::Status PopplerServiceImpl::Parse(
     grpc::ServerContext* context, const pdfv1::ParseRequest* request,
     grpc::ServerWriter<pdfv1::ParseResponse>* writer) {
+  ServerWriterSink<pdfv1::ParseResponse> sink(writer);
+  return ParseTo(context, request, nullptr, &sink);
+}
+
+grpc::Status PopplerServiceImpl::ParseTo(
+    grpc::ServerContext* context, const pdfv1::ParseRequest* request,
+    const std::string* stream_bytes,
+    MessageSink<pdfv1::ParseResponse>* writer) {
   if (request->has_pages()) {
     if (grpc::Status range = CheckPageRange(request->pages()); !range.ok()) {
       return range;
     }
   }
-  const ResolvedBytes resolved = ResolveDocumentBytes(request->document(), cache_);
+  const ResolvedBytes resolved =
+      stream_bytes != nullptr ? StreamBytes(stream_bytes)
+                              : ResolveDocumentBytes(request->document(), cache_);
   if (resolved.invalid_argument) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
   }
@@ -802,6 +831,14 @@ grpc::Status PopplerServiceImpl::Parse(
 grpc::Status PopplerServiceImpl::Render(
     grpc::ServerContext* context, const pdfv1::RenderRequest* request,
     grpc::ServerWriter<pdfv1::RenderResponse>* writer) {
+  ServerWriterSink<pdfv1::RenderResponse> sink(writer);
+  return RenderTo(context, request, nullptr, &sink);
+}
+
+grpc::Status PopplerServiceImpl::RenderTo(
+    grpc::ServerContext* context, const pdfv1::RenderRequest* request,
+    const std::string* stream_bytes,
+    MessageSink<pdfv1::RenderResponse>* writer) {
   // dpi sizes the raster splash allocates, so NaN and infinity are refused
   // along with zero and negative values, and so is a dpi above the cap;
   // the per-page pixel cap below bounds what remains.
@@ -821,7 +858,9 @@ grpc::Status PopplerServiceImpl::Render(
       return range;
     }
   }
-  const ResolvedBytes resolved = ResolveDocumentBytes(request->document(), cache_);
+  const ResolvedBytes resolved =
+      stream_bytes != nullptr ? StreamBytes(stream_bytes)
+                              : ResolveDocumentBytes(request->document(), cache_);
   if (resolved.invalid_argument) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
   }
@@ -895,6 +934,43 @@ grpc::Status PopplerServiceImpl::Render(
     if (!WriteUngated(gate, writer, msg)) return grpc::Status::OK;
   }
   return grpc::Status::OK;
+}
+
+grpc::Status PopplerServiceImpl::ParseStream(
+    grpc::ServerContext* context,
+    grpc::ServerReaderWriter<pdfv1::ParseStreamResponse, pdfv1::ParseStreamRequest>*
+        stream) {
+  ParseStreamHandlers handlers;
+  handlers.parse = [this, context](const pdfv1::ParseRequest& request,
+                                   const std::shared_ptr<std::string>& bytes,
+                                   MessageSink<pdfv1::ParseResponse>* sink,
+                                   RequestCancel*) {
+    return ParseTo(context, &request, bytes.get(), sink);
+  };
+  handlers.render = [this, context](const pdfv1::RenderRequest& request,
+                                    const std::shared_ptr<std::string>& bytes,
+                                    MessageSink<pdfv1::RenderResponse>* sink,
+                                    RequestCancel*) {
+    return RenderTo(context, &request, bytes.get(), sink);
+  };
+  handlers.verdict = [](pdfv1::BackendCapabilities* caps, pdfv1::LoadStatus status,
+                        const std::string& detail) {
+    LoadedDocument verdict;
+    verdict.status = status;
+    verdict.detail = detail;
+    FillCapabilities(verdict, caps);
+  };
+  handlers.sha256_hex = Sha256Hex;
+  // A verified upload is cached like a verified unary upload, so a client
+  // that falls back to Probe, Parse or Render can address it by hash.
+  handlers.verified = [this](const std::string& sha256,
+                             const std::shared_ptr<std::string>& bytes) {
+    cache_.Insert(sha256, *bytes);
+  };
+  ParseStreamLimits limits;
+  limits.max_document_bytes = kMaxStreamDocumentBytes;
+  limits.max_parallel_requests = kStreamParallelRequests;
+  return ServeParseStream(context, stream, handlers, limits);
 }
 
 grpc::Status PopplerServiceImpl::GetServiceInfo(

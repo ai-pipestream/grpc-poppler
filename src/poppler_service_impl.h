@@ -8,6 +8,7 @@
 
 #include "ai/protomolt/parse/pdf/v1/pdf_backend_service.grpc.pb.h"
 #include "document_cache.h"
+#include "parse_stream_session.h"
 
 namespace grpc_poppler {
 
@@ -72,7 +73,31 @@ class PopplerServiceImpl final
       const ai::protomolt::parse::pdf::v1::ServiceInfoRequest* request,
       ai::protomolt::parse::pdf::v1::ServiceInfoResponse* response) override;
 
+  // The bidirectional session (parse_stream_session.h): the chunked upload
+  // is assembled once, and the open, every ParsePages and every RenderPages
+  // are served by the same code as Parse and Render, on the stream's bytes
+  // with no re-upload and no cache lookup.
+  grpc::Status ParseStream(
+      grpc::ServerContext* context,
+      grpc::ServerReaderWriter<
+          ai::protomolt::parse::pdf::v1::ParseStreamResponse,
+          ai::protomolt::parse::pdf::v1::ParseStreamRequest>* stream) override;
+
  private:
+  // Parse and Render to any sink. stream_bytes, when set, are the document
+  // (a ParseStream's upload) and request->document() supplies only the
+  // password; otherwise the document resolves through the handshake.
+  grpc::Status ParseTo(
+      grpc::ServerContext* context,
+      const ai::protomolt::parse::pdf::v1::ParseRequest* request,
+      const std::string* stream_bytes,
+      MessageSink<ai::protomolt::parse::pdf::v1::ParseResponse>* writer);
+  grpc::Status RenderTo(
+      grpc::ServerContext* context,
+      const ai::protomolt::parse::pdf::v1::RenderRequest* request,
+      const std::string* stream_bytes,
+      MessageSink<ai::protomolt::parse::pdf::v1::RenderResponse>* writer);
+
   DocumentCache cache_;
   const ResourceLimits limits_;
 };
