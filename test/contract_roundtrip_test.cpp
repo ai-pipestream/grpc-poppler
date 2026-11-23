@@ -6,8 +6,9 @@
 // cropped pages (frames.pdf), names that are not UTF-8 in the file and a
 // decode cap (encodings.pdf), attachments whose data cannot be had whole
 // (damaged_attachments.pdf), pages poppler cannot load
-// (missing_pages.pdf), page ranges, Render bounds, and the arm64 gate under
-// a stalled client.
+// (missing_pages.pdf), what poppler reports about damaged content
+// (damaged_content.pdf), page ranges, Render bounds, and the arm64 gate
+// under a stalled client.
 
 #include <chrono>
 #include <cmath>
@@ -86,9 +87,10 @@ int main(int argc, char** argv) {
   const std::string missing_pages = ReadFile(dir + "/missing_pages.pdf");
   const std::string damaged_attachments =
       ReadFile(dir + "/damaged_attachments.pdf");
+  const std::string damaged_content = ReadFile(dir + "/damaged_content.pdf");
   Check(!hello.empty() && !rich.empty() && !frames.empty() &&
             !encodings.empty() && !missing_pages.empty() &&
-            !damaged_attachments.empty(),
+            !damaged_attachments.empty() && !damaged_content.empty(),
         "fixtures read");
 
   grpc_poppler::PopplerServiceImpl service;
@@ -363,7 +365,25 @@ int main(int argc, char** argv) {
       }
       return false;
     };
-    Check(warnings.size() == 3, "one warning for each damaged attachment");
+    // The service's own warnings, one for each attachment, and what
+    // poppler said while reading them.
+    int own = 0;
+    int from_poppler = 0;
+    bool all_on_attachments = true;
+    for (const auto& warning : warnings) {
+      if (warning.message().rfind("poppler ", 0) == 0) {
+        ++from_poppler;
+      } else {
+        ++own;
+      }
+      if (warning.family() != pdfv1::PDF_FAMILY_ATTACHMENTS ||
+          warning.has_page_index()) {
+        all_on_attachments = false;
+      }
+    }
+    Check(own == 3, "one warning for each damaged attachment");
+    Check(from_poppler >= 1 && all_on_attachments,
+          "what poppler said about the embedded files is carried too");
     Check(warned("short.bin", "decodes to 2 bytes but declares /Params /Size 5"),
           "a stream that decodes short of its declared size is warned about");
     Check(warned("garbage.bin", "cannot start to decode"),
@@ -701,6 +721,131 @@ int main(int argc, char** argv) {
     Check(status.error_code() == grpc::StatusCode::INTERNAL &&
               status.error_message().find("page 1") != std::string::npos,
           "a page poppler cannot load fails the Render, naming the page");
+  }
+
+  // What poppler says about a document reaches the caller. poppler reports
+  // damaged page content, a rebuilt xref table and the like only through
+  // its error callback, and hands back whatever it could still read; Parse
+  // carries each message in the trailer, on the page and the family it was
+  // reading, so a partly read page is not taken for a whole one.
+  struct Warned {
+    grpc::Status status;
+    std::map<uint32_t, std::string> page_text;
+    std::vector<pdfv1::ParseWarning> warnings;
+  };
+  auto parse_warned = [](pdfv1::PdfBackendService::Stub& target,
+                         const std::string& data,
+                         std::vector<pdfv1::PdfFamily> families) {
+    Warned out;
+    grpc::ClientContext ctx;
+    SetDeadline(&ctx);
+    pdfv1::ParseRequest request;
+    request.mutable_document()->set_data(data);
+    for (const pdfv1::PdfFamily family : families) request.add_families(family);
+    auto reader = target.Parse(&ctx, request);
+    pdfv1::ParseResponse msg;
+    while (reader->Read(&msg)) {
+      if (msg.has_page()) {
+        std::string& text = out.page_text[msg.page().page_index()];
+        for (const auto& cell : msg.page().text_cells()) {
+          text += cell.text() + " ";
+        }
+      }
+      if (msg.has_trailer()) {
+        out.warnings.assign(msg.trailer().warnings().begin(),
+                            msg.trailer().warnings().end());
+      }
+    }
+    out.status = reader->Finish();
+    return out;
+  };
+  // damaged_content.pdf (test/fixtures/make_damaged_content_pdf.py): page 0
+  // is clean, page 1 runs 200 times into an operator that does not exist
+  // between two words, and page 2's content is not the Flate data it says
+  // it is.
+  {
+    const Warned all = parse_warned(*stub, damaged_content, {});
+    Check(all.status.ok() && all.page_text.size() == 3,
+          "damaged_content.pdf parses to the end, with all three pages");
+    Check(all.page_text.count(1) == 1 &&
+              all.page_text.at(1).find("Before") != std::string::npos &&
+              all.page_text.at(1).find("After") != std::string::npos,
+          "the text around the damage on page 1 is kept");
+    int on_clean_page = 0;
+    int on_operator_page = 0;
+    int on_flate_page = 0;
+    bool operator_named = false;
+    bool repeats_counted = false;
+    bool all_from_poppler = true;
+    bool all_on_text = true;
+    for (const auto& warning : all.warnings) {
+      if (warning.message().rfind("poppler ", 0) != 0) all_from_poppler = false;
+      if (!warning.has_page_index()) continue;
+      if (warning.family() != pdfv1::PDF_FAMILY_TEXT_CELLS) all_on_text = false;
+      if (warning.page_index() == 0) ++on_clean_page;
+      if (warning.page_index() == 1) {
+        ++on_operator_page;
+        if (warning.message().find("bogusop") != std::string::npos) {
+          operator_named = true;
+          if (warning.message().find("200 times") != std::string::npos) {
+            repeats_counted = true;
+          }
+        }
+      }
+      if (warning.page_index() == 2) ++on_flate_page;
+    }
+    Check(on_clean_page == 0, "a clean page carries no warning");
+    Check(on_operator_page >= 1 && operator_named,
+          "page 1's warning names the operator poppler did not know");
+    Check(on_operator_page <= 4 && repeats_counted,
+          "a message poppler repeats is one warning that counts the repeats");
+    Check(on_flate_page >= 1,
+          "page 2's undecodable content stream is warned about");
+    Check(all_from_poppler && all_on_text,
+          "page warnings say they are poppler's and name the text family");
+
+    // The warnings belong to the work a request asked for: a request for
+    // the document metadata alone reads no page content and warns of none.
+    const Warned meta_only =
+        parse_warned(*stub, damaged_content, {pdfv1::PDF_FAMILY_DOC_METADATA});
+    Check(meta_only.status.ok() && meta_only.warnings.empty(),
+          "no page content is read, so none is warned about");
+  }
+  // A document whose xref table sends poppler to the wrong place for the
+  // page tree still loads: poppler says so and rebuilds the table by
+  // scanning the file. That is told once, as warnings on the document (no
+  // page, no family), although the attachment and form field readers open
+  // the same bytes again and hear the same thing.
+  {
+    std::string wrong_xref = hello;
+    // hello.pdf's table is "xref\n0 6\n" and six 20-byte entries; entry 2
+    // is the page tree's.
+    const size_t table = wrong_xref.find("xref\n0 6\n");
+    Check(table != std::string::npos, "hello.pdf has the xref table to damage");
+    if (table != std::string::npos) {
+      wrong_xref.replace(table + 9 + 2 * 20, 10, "0000000003");
+    }
+    const Warned rebuilt = parse_warned(*stub, wrong_xref, {});
+    Check(rebuilt.status.ok() && rebuilt.page_text.count(0) == 1 &&
+              rebuilt.page_text.at(0).find("Hello") != std::string::npos,
+          "a document with a wrong xref entry still parses");
+    int on_document = 0;
+    std::map<std::string, int> seen;
+    for (const auto& warning : rebuilt.warnings) {
+      if (!warning.has_page_index() && !warning.has_family()) ++on_document;
+      ++seen[warning.message()];
+    }
+    bool repeated = false;
+    for (const auto& [message, times] : seen) {
+      if (times > 1) repeated = true;
+    }
+    Check(on_document >= 1, "the damaged xref table is warned about");
+    Check(on_document == static_cast<int>(rebuilt.warnings.size()) && !repeated,
+          "what the load said is not said again by a second open");
+
+    const Warned clean = parse_warned(*stub, hello, {});
+    Check(clean.status.ok() && clean.warnings.empty(),
+          "a clean document parses without warnings");
   }
 
   // Render hello.pdf at 72 DPI: BGR24, the same surface gRParse consumes.

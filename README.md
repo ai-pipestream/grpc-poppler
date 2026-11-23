@@ -124,6 +124,21 @@ ends a stream it stops decoding part way as if at its end, so the mismatch
 is the one sign of that damage). If poppler's core API cannot open the document at all, no
 attachment is listed and a warning says so.
 
+What poppler itself reports reaches the caller the same way. poppler tells
+of a damaged content stream, a stream that does not decode or an xref
+table it had to rebuild only through its error callback, and hands back
+whatever it could still read, so `Parse` collects that callback for the
+request (`src/poppler_errors.h`) and puts each message in the trailer as a
+`ParseWarning` on the page and the family it was reading: no page and no
+family for what loading the document said, `PAGE_INVENTORY` and
+`TEXT_CELLS` with the `page_index` for a page, the family alone for the
+document-level ones. A page with such a warning may be missing text. The
+messages start with `poppler ` and its category (`syntax error`,
+`internal error`, ...); one that repeats is carried once with its count,
+and past 16 different messages for one piece of work the rest are counted,
+not listed. `Render` and `Probe` have no warning field in the contract
+yet, so what poppler says there goes to the service log.
+
 A set `PageRange` must have `end` greater than `begin`, the contract's one
 rule for it; anything else is `INVALID_ARGUMENT`. An `end` past the
 document stops at its last page, and a range that starts past it selects

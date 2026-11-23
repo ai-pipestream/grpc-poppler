@@ -25,6 +25,7 @@
 
 #include "document_cache.h"
 #include "poppler_attachments.h"
+#include "poppler_errors.h"
 #include "poppler_forms.h"
 #include "sha256.h"
 #include "utf8.h"
@@ -479,6 +480,9 @@ grpc::Status PopplerServiceImpl::Probe(grpc::ServerContext* /*context*/,
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
   }
   PopplerGate gate;
+  // BackendCapabilities has no place for warnings; what poppler says while
+  // probing goes to the log when this closes.
+  PopplerErrorScope engine_errors;
   LoadedDocument loaded;
   if (resolved.status == pdfv1::LOAD_STATUS_OK) {
     LoadDocument(*resolved.bytes, request->document(), &loaded);
@@ -513,6 +517,13 @@ grpc::Status PopplerServiceImpl::ParseTo(
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
   }
   PopplerGate gate;
+  // What poppler reports through its error callback while this request
+  // runs. Each piece of work below is followed by a Take that moves what
+  // was said during it into the trailer's warnings, on the page and the
+  // family the work was for. Declared before the poppler objects, so it
+  // outlives them.
+  PopplerErrorScope engine_errors;
+  std::vector<pdfv1::ParseWarning> warnings;
   LoadedDocument loaded;
   if (resolved.status == pdfv1::LOAD_STATUS_OK) {
     LoadDocument(*resolved.bytes, request->document(), &loaded);
@@ -529,17 +540,26 @@ grpc::Status PopplerServiceImpl::ParseTo(
   pdfv1::ParseResponse header_msg;
   auto* header = header_msg.mutable_header();
   FillCapabilities(loaded, header->mutable_capabilities());
+  // What loading the document said (a rebuilt xref table, a damaged page
+  // tree) is about the document as a whole: no page, no family.
+  engine_errors.Take(std::nullopt, std::nullopt, &warnings);
   // Pages the document counts but poppler cannot load (a page tree that
   // holds fewer pages than its /Count): left out of the inventory, and
   // each named by a warning in the trailer.
-  std::vector<int> unloadable_pages;
   for (int i = 0; i < page_count; ++i) {
     pages[static_cast<size_t>(i)].reset(loaded.doc->create_page(i));
     poppler::page* page = pages[static_cast<size_t>(i)].get();
     if (page == nullptr) {
-      unloadable_pages.push_back(i);
-      continue;
+      pdfv1::ParseWarning& warning = warnings.emplace_back();
+      warning.set_page_index(static_cast<uint32_t>(i));
+      warning.set_family(pdfv1::PDF_FAMILY_PAGE_INVENTORY);
+      warning.set_message("poppler could not load page " + std::to_string(i) +
+                          "; it is left out of the inventory and the page "
+                          "chunks");
     }
+    engine_errors.Take(static_cast<uint32_t>(i),
+                       pdfv1::PDF_FAMILY_PAGE_INVENTORY, &warnings);
+    if (page == nullptr) continue;
     auto* info = header->add_pages();
     info->set_page_index(static_cast<uint32_t>(i));
     const bool quarter_turn = IsQuarterTurn(*page);
@@ -571,15 +591,6 @@ grpc::Status PopplerServiceImpl::ParseTo(
   std::map<pdfv1::PdfFamily, uint64_t> counts;
   counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] =
       static_cast<uint64_t>(header->pages_size());
-  std::vector<pdfv1::ParseWarning> warnings;
-  for (const int index : unloadable_pages) {
-    pdfv1::ParseWarning& warning = warnings.emplace_back();
-    warning.set_page_index(static_cast<uint32_t>(index));
-    warning.set_family(pdfv1::PDF_FAMILY_PAGE_INVENTORY);
-    warning.set_message("poppler could not load page " +
-                        std::to_string(index) +
-                        "; it is left out of the inventory and the page chunks");
-  }
 
   // Document-level families.
   if (WantFamily(*request, pdfv1::PDF_FAMILY_DOC_METADATA)) {
@@ -615,6 +626,8 @@ grpc::Status PopplerServiceImpl::ParseTo(
     }
     if (loaded.doc->is_linearized()) meta->set_linearized(true);
     ++counts[pdfv1::PDF_FAMILY_DOC_METADATA];
+    engine_errors.Take(std::nullopt, pdfv1::PDF_FAMILY_DOC_METADATA,
+                       &warnings);
     client_ok = WriteUngated(gate, writer, msg);
   }
   if (client_ok && loaded.doc->is_encrypted() &&
@@ -633,10 +646,13 @@ grpc::Status PopplerServiceImpl::ParseTo(
     enc->set_can_print_high_res(
         loaded.doc->has_permission(poppler::perm_print_high_resolution));
     ++counts[pdfv1::PDF_FAMILY_ENCRYPTION_INFO];
+    engine_errors.Take(std::nullopt, pdfv1::PDF_FAMILY_ENCRYPTION_INFO,
+                       &warnings);
     client_ok = WriteUngated(gate, writer, msg);
   }
   if (client_ok && WantFamily(*request, pdfv1::PDF_FAMILY_OUTLINE)) {
     std::unique_ptr<poppler::toc> toc(loaded.doc->create_toc());
+    engine_errors.Take(std::nullopt, pdfv1::PDF_FAMILY_OUTLINE, &warnings);
     if (toc != nullptr && toc->root() != nullptr &&
         !toc->root()->children().empty()) {
       pdfv1::ParseResponse msg;
@@ -703,6 +719,10 @@ grpc::Status PopplerServiceImpl::ParseTo(
           ++counts[pdfv1::PDF_FAMILY_ATTACHMENTS];
           return WriteUngated(gate, writer, msg);
         });
+    // The reader opens the bytes a second time, so what the load said is
+    // not said again.
+    engine_errors.TakeAfterReopen(std::nullopt, pdfv1::PDF_FAMILY_ATTACHMENTS,
+                                  &warnings);
     switch (read) {
       case AttachmentsRead::kDone:
         break;
@@ -740,6 +760,7 @@ grpc::Status PopplerServiceImpl::ParseTo(
       ref->set_kind(MapFontKind(info.type()));
       ref->set_embedded(info.is_embedded());
     }
+    engine_errors.Take(std::nullopt, pdfv1::PDF_FAMILY_FONTS, &warnings);
     if (chunk->fonts_size() > 0) {
       counts[pdfv1::PDF_FAMILY_FONTS] +=
           static_cast<uint64_t>(chunk->fonts_size());
@@ -759,6 +780,8 @@ grpc::Status PopplerServiceImpl::ParseTo(
     form_fields = ReadFormFields(*resolved.bytes,
                                  DocumentPassword(request->document()), begin,
                                  end);
+    engine_errors.TakeAfterReopen(std::nullopt, pdfv1::PDF_FAMILY_FORM_FIELDS,
+                                  &warnings);
   }
   // Page chunks carry only page-level families; a request for none of them
   // gets no chunks.
@@ -774,6 +797,11 @@ grpc::Status PopplerServiceImpl::ParseTo(
       const TextFrame frame(*page);
       const auto boxes =
           page->text_list(poppler::page::text_list_include_font);
+      // text_list() returns the words it laid out before the content
+      // stream broke off, with nothing to tell them from a whole page;
+      // what poppler said about the stream is the only sign.
+      engine_errors.Take(static_cast<uint32_t>(i),
+                         pdfv1::PDF_FAMILY_TEXT_CELLS, &warnings);
       for (const auto& box : boxes) {
         auto* cell = chunk->add_text_cells();
         cell->set_text(ToUtf8(box.text()));
@@ -865,6 +893,10 @@ grpc::Status PopplerServiceImpl::RenderTo(
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
   }
   PopplerGate gate;
+  // RenderResponse has no place for warnings yet (grpc-poppler#18 tracks
+  // the contract addition); until it has, what poppler says while
+  // rendering goes to the log when this closes.
+  PopplerErrorScope engine_errors;
   LoadedDocument loaded;
   if (resolved.status == pdfv1::LOAD_STATUS_OK) {
     LoadDocument(*resolved.bytes, request->document(), &loaded);

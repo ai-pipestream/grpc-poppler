@@ -8,14 +8,13 @@
 // poppler's core headers, installed by its ENABLE_UNSTABLE_API_ABI_HEADERS
 // option; poppler.pc puts <includedir>/poppler on the include path.
 #include <Catalog.h>
-#include <Error.h>
 #include <FileSpec.h>
-#include <GlobalParams.h>
 #include <Object.h>
 #include <PDFDoc.h>
 #include <Stream.h>
 #include <goo/GooString.h>
 
+#include "poppler_errors.h"
 #include "utf8.h"
 
 namespace grpc_poppler {
@@ -54,10 +53,9 @@ AttachmentsRead ReadAttachments(
     const std::string& data, const std::optional<std::string>& password,
     std::optional<uint64_t> max_data_bytes,
     const std::function<bool(pdfv1::AttachmentMeta&&, AttachmentData)>& emit) {
-  // poppler-cpp documents derive from this reference-counted initializer;
-  // holding one here keeps globalParams alive while the core document is
-  // open. Should this be the first holder, diagnostics stay quiet.
-  GlobalParamsIniter params([](ErrorCategory, Goffset, const char*) {});
+  // Keeps globalParams alive for the core document, and sends what poppler
+  // reports to the caller's PopplerErrorScope (src/poppler_errors.h).
+  EnsurePopplerErrorCapture();
   std::optional<GooString> owner;
   std::optional<GooString> user;
   if (password.has_value()) {
