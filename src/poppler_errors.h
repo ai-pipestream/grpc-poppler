@@ -3,8 +3,10 @@
 #pragma once
 
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "ai/protomolt/parse/pdf/v1/pdf_backend_service.pb.h"
@@ -62,6 +64,11 @@ class PopplerErrorScope {
       std::optional<uint32_t> page_index,
       std::optional<ai::protomolt::parse::pdf::v1::PdfFamily> family,
       std::vector<ai::protomolt::parse::pdf::v1::ParseWarning>* warnings);
+
+  // The first message reported since the last Take that starts with one
+  // of the prefixes, or with no prefixes the first message of all; nullptr
+  // when there is none. The message stays held.
+  const std::string* Find(std::initializer_list<std::string_view> prefixes) const;
 
   // Called by the process callback; not for handlers.
   void Collect(int category, int64_t position, const char* message);

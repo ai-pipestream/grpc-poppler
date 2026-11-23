@@ -124,6 +124,19 @@ void PopplerErrorScope::Collect(int category, int64_t position,
   entry.times = 1;
 }
 
+const std::string* PopplerErrorScope::Find(
+    std::initializer_list<std::string_view> prefixes) const {
+  for (const Entry& entry : entries_) {
+    if (prefixes.size() == 0) return &entry.message;
+    for (const std::string_view prefix : prefixes) {
+      if (entry.message.compare(0, prefix.size(), prefix) == 0) {
+        return &entry.message;
+      }
+    }
+  }
+  return nullptr;
+}
+
 bool PopplerErrorScope::SaidByLoad(const Entry& entry) const {
   for (const Entry& said : load_entries_) {
     if (said.category == entry.category && said.position == entry.position &&

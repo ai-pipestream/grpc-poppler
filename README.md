@@ -96,6 +96,27 @@ Setting either to `0` disables caching; a document larger than the byte
 ceiling is never stored. SHA-256 comes from the boringssl `crypto` target
 the gRPC build already compiles; there is no new dependency.
 
+## Load verdicts
+
+A document that does not load is answered with a typed `LoadStatus`, which
+says what is wrong with the document and not what the request happened to
+carry. poppler-cpp tells only "not opened" from "opened but locked", so the
+verdict comes from poppler's core error code for the same bytes
+(`src/poppler_load.h`) and from what its security handler reported:
+
+| The document | `load_status` |
+|---|---|
+| is damaged past opening, or its catalog cannot be read | `CORRUPT`, with or without a password in the request |
+| is encrypted and no password was sent | `PASSWORD_REQUIRED` |
+| is encrypted and the password sent does not open it | `PASSWORD_INCORRECT` |
+| is encrypted by a security handler poppler does not have, or a Standard handler revision or dictionary it cannot use | `UNSUPPORTED_ENCRYPTION`, with or without a password: no password opens it |
+| fails for any other reason | `ENGINE_ERROR` |
+
+`load_detail` carries poppler's error code and its message. poppler itself
+opens a document whose Standard handler dictionary it cannot use as if it
+were not encrypted, and would hand out the encrypted strings and streams as
+they are; this service answers `UNSUPPORTED_ENCRYPTION` instead.
+
 ## Resource limits
 
 One request cannot make the service decode without bound. The defaults

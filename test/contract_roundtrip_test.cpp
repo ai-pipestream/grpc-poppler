@@ -7,7 +7,8 @@
 // decode cap (encodings.pdf), attachments whose data cannot be had whole
 // (damaged_attachments.pdf), pages poppler cannot load
 // (missing_pages.pdf), what poppler reports about damaged content
-// (damaged_content.pdf), page ranges, Render bounds, and the arm64 gate
+// (damaged_content.pdf), the typed load verdicts for passwords, encryption
+// poppler has no handler for and damaged files (encrypted.pdf), page ranges, Render bounds, and the arm64 gate
 // under a stalled client.
 
 #include <chrono>
@@ -88,9 +89,11 @@ int main(int argc, char** argv) {
   const std::string damaged_attachments =
       ReadFile(dir + "/damaged_attachments.pdf");
   const std::string damaged_content = ReadFile(dir + "/damaged_content.pdf");
+  const std::string encrypted = ReadFile(dir + "/encrypted.pdf");
   Check(!hello.empty() && !rich.empty() && !frames.empty() &&
             !encodings.empty() && !missing_pages.empty() &&
-            !damaged_attachments.empty() && !damaged_content.empty(),
+            !damaged_attachments.empty() && !damaged_content.empty() &&
+            !encrypted.empty(),
         "fixtures read");
 
   grpc_poppler::PopplerServiceImpl service;
@@ -162,6 +165,120 @@ int main(int argc, char** argv) {
     Check(stub->Probe(&ctx, request, &response).ok(), "non-PDF Probe OK");
     Check(response.capabilities().load_status() == pdfv1::LOAD_STATUS_NOT_PDF,
           "non-PDF bytes report LOAD_STATUS_NOT_PDF");
+  }
+
+  // Load verdicts say what is wrong with the document, not what the request
+  // happened to carry. encrypted.pdf (test/fixtures/make_encrypted_pdf.py)
+  // opens with the password "user": without one a password is required,
+  // with another the password is incorrect. A document that is damaged
+  // stays corrupt when a password comes with it, and one encrypted in a way
+  // poppler has no handler for is unsupported encryption with or without a
+  // password, since no password can open it.
+  {
+    auto probe = [&stub](const std::string& data,
+                         const std::optional<std::string>& password) {
+      grpc::ClientContext ctx;
+      SetDeadline(&ctx);
+      pdfv1::ProbeRequest request;
+      request.mutable_document()->set_data(data);
+      if (password.has_value()) request.mutable_document()->set_password(*password);
+      pdfv1::ProbeResponse response;
+      Check(stub->Probe(&ctx, request, &response).ok(), "verdict Probe OK");
+      return response.capabilities();
+    };
+    Check(probe(encrypted, std::nullopt).load_status() ==
+              pdfv1::LOAD_STATUS_PASSWORD_REQUIRED,
+          "an encrypted document without a password requires one");
+    Check(probe(encrypted, "wrong").load_status() ==
+              pdfv1::LOAD_STATUS_PASSWORD_INCORRECT,
+          "a wrong password is incorrect");
+    Check(probe(encrypted, "user").load_status() == pdfv1::LOAD_STATUS_OK,
+          "the user password opens the document");
+    {
+      grpc::ClientContext ctx;
+      SetDeadline(&ctx);
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(encrypted);
+      request.mutable_document()->set_password("user");
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse msg;
+      std::string text;
+      bool encryption_info = false;
+      while (reader->Read(&msg)) {
+        if (msg.has_page()) {
+          for (const auto& cell : msg.page().text_cells()) text += cell.text();
+        }
+        if (msg.has_encryption()) encryption_info = true;
+      }
+      Check(reader->Finish().ok() && text == "Sealed" && encryption_info,
+            "the opened document's text decrypts and its permissions are read");
+    }
+
+    const std::string not_a_document = "%PDF-1.7\nnot a document\n";
+    Check(probe(not_a_document, std::nullopt).load_status() ==
+              pdfv1::LOAD_STATUS_CORRUPT,
+          "a damaged document is corrupt");
+    const pdfv1::BackendCapabilities damaged_with_password =
+        probe(not_a_document, "secret");
+    Check(damaged_with_password.load_status() == pdfv1::LOAD_STATUS_CORRUPT,
+          "a damaged document sent with a password is still corrupt");
+    Check(damaged_with_password.load_detail().find("poppler error code 3") !=
+              std::string::npos,
+          "the verdict's detail carries poppler's error code");
+
+    // hello.pdf with an /Encrypt dictionary added to its trailer.
+    auto with_encrypt = [&hello](const std::string& dictionary) {
+      std::string out = hello;
+      const std::string trailer = "<< /Size 6 /Root 1 0 R >>";
+      const size_t at = out.rfind(trailer);
+      Check(at != std::string::npos, "hello.pdf has the trailer to extend");
+      if (at != std::string::npos) {
+        out.replace(at, trailer.size(),
+                    "<< /Size 6 /Root 1 0 R /Encrypt " + dictionary + " >>");
+      }
+      return out;
+    };
+    const std::string unknown_handler =
+        with_encrypt("<< /Filter /Example.Vault /V 1 >>");
+    const pdfv1::BackendCapabilities no_handler =
+        probe(unknown_handler, std::nullopt);
+    Check(no_handler.load_status() ==
+              pdfv1::LOAD_STATUS_UNSUPPORTED_ENCRYPTION,
+          "a security handler poppler does not have is unsupported encryption");
+    Check(no_handler.load_detail().find("Example.Vault") != std::string::npos,
+          "the detail names the security handler");
+    Check(probe(unknown_handler, "secret").load_status() ==
+              pdfv1::LOAD_STATUS_UNSUPPORTED_ENCRYPTION,
+          "and stays unsupported when a password is sent");
+    // poppler opens a document whose Standard handler dictionary it cannot
+    // use as if it were not encrypted at all; the verdict must not be OK.
+    const std::string future_revision = with_encrypt(
+        "<< /Filter /Standard /V 9 /R 9 /P -4 "
+        "/O (0123456789abcdef0123456789abcdef) "
+        "/U (0123456789abcdef0123456789abcdef) >>");
+    Check(probe(future_revision, std::nullopt).load_status() ==
+              pdfv1::LOAD_STATUS_UNSUPPORTED_ENCRYPTION,
+          "a Standard handler revision poppler does not implement is "
+          "unsupported encryption");
+
+    // Render answers a failed load in its head, with the same verdict.
+    {
+      grpc::ClientContext ctx;
+      SetDeadline(&ctx);
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(unknown_handler);
+      request.mutable_document()->set_password("secret");
+      request.set_dpi(36.0);
+      auto reader = stub->Render(&ctx, request);
+      pdfv1::RenderResponse msg;
+      pdfv1::LoadStatus head = pdfv1::LOAD_STATUS_UNSPECIFIED;
+      while (reader->Read(&msg)) {
+        if (msg.has_head()) head = msg.head().load_status();
+      }
+      Check(reader->Finish().ok() &&
+                head == pdfv1::LOAD_STATUS_UNSUPPORTED_ENCRYPTION,
+            "Render's head carries the unsupported encryption verdict");
+    }
   }
 
   // Parse rich.pdf.

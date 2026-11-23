@@ -27,6 +27,7 @@
 #include "poppler_attachments.h"
 #include "poppler_errors.h"
 #include "poppler_forms.h"
+#include "poppler_load.h"
 #include "sha256.h"
 #include "utf8.h"
 
@@ -181,8 +182,33 @@ ResolvedBytes StreamBytes(const std::string* bytes) {
   return out;
 }
 
+// The password a request opens its document with, for the readers that
+// open a second, core document over the same bytes.
+std::optional<std::string> DocumentPassword(
+    const pdfv1::PdfDocument& document) {
+  if (!document.has_password()) return std::nullopt;
+  return document.password();
+}
+
+// Loads the document, or says why it does not load. poppler-cpp tells
+// only "not opened" from "opened but locked", so the verdict for a
+// failure comes from poppler's core error code for the same bytes
+// (src/poppler_load.h) and from what its security handler reported
+// (errors holds what poppler said during the load):
+//
+//   damaged file, unreadable catalog       CORRUPT, password or not
+//   encrypted, no usable security handler  UNSUPPORTED_ENCRYPTION, password
+//                                          or not: no password opens it
+//                                          (poppler itself opens some of
+//                                          these as if unencrypted)
+//   encrypted, handler refused             PASSWORD_REQUIRED without a
+//                                          password, PASSWORD_INCORRECT
+//                                          with one
+//   anything else                          ENGINE_ERROR
+//
+// load_detail carries the code and poppler's message.
 void LoadDocument(const std::string& data, const pdfv1::PdfDocument& request,
-                  LoadedDocument* out) {
+                  const PopplerErrorScope& errors, LoadedDocument* out) {
   if (data.rfind("%PDF-", 0) != 0) {
     out->status = pdfv1::LOAD_STATUS_NOT_PDF;
     out->detail = "missing %PDF- header";
@@ -197,29 +223,67 @@ void LoadDocument(const std::string& data, const pdfv1::PdfDocument& request,
   out->doc.reset(poppler::document::load_from_raw_data(data.data(),
                                                        data.size(), owner,
                                                        user));
-  if (out->doc == nullptr) {
-    out->status = request.has_password()
-                      ? pdfv1::LOAD_STATUS_PASSWORD_INCORRECT
-                      : pdfv1::LOAD_STATUS_CORRUPT;
-    out->detail = "poppler could not open the document";
-    return;
-  }
-  if (out->doc->is_locked()) {
-    out->status = request.has_password()
-                      ? pdfv1::LOAD_STATUS_PASSWORD_INCORRECT
-                      : pdfv1::LOAD_STATUS_PASSWORD_REQUIRED;
+  // Every way poppler's SecurityHandler fails to set itself up
+  // (poppler/SecurityHandler.cc at the pinned version): no handler by that
+  // /Filter name, or a Standard handler dictionary it cannot use. A handler
+  // that set itself up and refused the password reports "Incorrect
+  // password" alone.
+  const std::string* no_handler = errors.Find(
+      {"Couldn't find the '", "Missing or invalid 'Filter' entry",
+       "Unsupported version/revision", "Invalid encryption key length",
+       "Weird encryption"});
+  if (out->doc != nullptr && !out->doc->is_locked()) {
+    if (no_handler == nullptr) {
+      out->status = pdfv1::LOAD_STATUS_OK;
+      return;
+    }
+    // poppler opens a document whose Standard security handler it could
+    // not set up as if it were not encrypted, and would hand out the
+    // encrypted strings and streams as they are.
     out->doc.reset();
+    out->status = pdfv1::LOAD_STATUS_UNSUPPORTED_ENCRYPTION;
+    out->detail =
+        "poppler could not set up the document's security handler and "
+        "would read the document undecrypted: " +
+        *no_handler;
     return;
   }
-  out->status = pdfv1::LOAD_STATUS_OK;
-}
-
-// The password a request opens its document with, for the readers that
-// open a second, core document over the same bytes.
-std::optional<std::string> DocumentPassword(
-    const pdfv1::PdfDocument& document) {
-  if (!document.has_password()) return std::nullopt;
-  return document.password();
+  out->doc.reset();
+  const int code = CoreLoadErrorCode(data, DocumentPassword(request));
+  const std::string coded = std::string("poppler error code ") +
+                            std::to_string(code) + ", " +
+                            CoreLoadErrorWords(code);
+  const auto with_message = [&coded](const std::string* message) {
+    return message != nullptr ? coded + ": " + *message : coded;
+  };
+  switch (code) {
+    case kCoreErrorEncrypted: {
+      if (no_handler != nullptr) {
+        out->status = pdfv1::LOAD_STATUS_UNSUPPORTED_ENCRYPTION;
+        out->detail = with_message(no_handler);
+      } else {
+        out->status = request.has_password()
+                          ? pdfv1::LOAD_STATUS_PASSWORD_INCORRECT
+                          : pdfv1::LOAD_STATUS_PASSWORD_REQUIRED;
+        out->detail = coded;
+      }
+      return;
+    }
+    case kCoreErrorBadCatalog:
+    case kCoreErrorDamaged:
+      out->status = pdfv1::LOAD_STATUS_CORRUPT;
+      out->detail = with_message(errors.Find({}));
+      return;
+    case kCoreErrorNone:
+      out->status = pdfv1::LOAD_STATUS_ENGINE_ERROR;
+      out->detail =
+          "poppler-cpp did not open a document poppler's core API opens";
+      return;
+    default:
+      out->status = pdfv1::LOAD_STATUS_ENGINE_ERROR;
+      out->detail = with_message(errors.Find({}));
+      return;
+  }
 }
 
 // A number for an error message: 1200 rather than 1200.000000.
@@ -485,7 +549,8 @@ grpc::Status PopplerServiceImpl::Probe(grpc::ServerContext* /*context*/,
   PopplerErrorScope engine_errors;
   LoadedDocument loaded;
   if (resolved.status == pdfv1::LOAD_STATUS_OK) {
-    LoadDocument(*resolved.bytes, request->document(), &loaded);
+    LoadDocument(*resolved.bytes, request->document(), engine_errors,
+                 &loaded);
   } else {
     loaded.status = resolved.status;
     loaded.detail = resolved.detail;
@@ -526,7 +591,8 @@ grpc::Status PopplerServiceImpl::ParseTo(
   std::vector<pdfv1::ParseWarning> warnings;
   LoadedDocument loaded;
   if (resolved.status == pdfv1::LOAD_STATUS_OK) {
-    LoadDocument(*resolved.bytes, request->document(), &loaded);
+    LoadDocument(*resolved.bytes, request->document(), engine_errors,
+                 &loaded);
   } else {
     loaded.status = resolved.status;
     loaded.detail = resolved.detail;
@@ -899,7 +965,8 @@ grpc::Status PopplerServiceImpl::RenderTo(
   PopplerErrorScope engine_errors;
   LoadedDocument loaded;
   if (resolved.status == pdfv1::LOAD_STATUS_OK) {
-    LoadDocument(*resolved.bytes, request->document(), &loaded);
+    LoadDocument(*resolved.bytes, request->document(), engine_errors,
+                 &loaded);
   } else {
     loaded.status = resolved.status;
     loaded.detail = resolved.detail;
