@@ -157,8 +157,13 @@ document-level ones. A page with such a warning may be missing text. The
 messages start with `poppler ` and its category (`syntax error`,
 `internal error`, ...); one that repeats is carried once with its count,
 and past 16 different messages for one piece of work the rest are counted,
-not listed. `Render` and `Probe` have no warning field in the contract
-yet, so what poppler says there goes to the service log.
+not listed. `Render` does the same beside each raster: what poppler
+reported while it drew a page rides in that message's
+`RenderResponse.warnings`, with the page's index and the `PAGE_RASTER`
+family, so a raster with warnings may be missing part of the page. What
+loading the document said is `Parse`'s to tell; in `Render` it goes to the
+service log, as everything poppler says in `Probe` does (the contract has
+no warning field there).
 
 A set `PageRange` must have `end` greater than `begin`, the contract's one
 rule for it; anything else is `INVALID_ARGUMENT`. An `end` past the

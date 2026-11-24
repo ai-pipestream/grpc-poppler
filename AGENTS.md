@@ -44,7 +44,9 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   `PopplerErrorScope` collects what is said on its thread. Every piece of
   poppler work in `ParseTo` is followed by a `Take` that turns it into
   typed `ParseWarning`s for that page and family; new poppler work needs
-  its own `Take`, or its messages land on the next family. Never install
+  its own `Take`, or its messages land on the next family. `RenderTo`
+  takes after each page and sends the warnings beside that page's raster
+  (`RenderResponse.warnings`). Never install
   another callback (`poppler::set_debug_error_function`, a
   `GlobalParamsIniter` with a lambda): the core API readers call
   `EnsurePopplerErrorCapture` instead.

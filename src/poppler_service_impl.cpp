@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -929,6 +930,17 @@ grpc::Status PopplerServiceImpl::Render(
   return RenderTo(context, request, nullptr, &sink);
 }
 
+namespace {
+
+// What poppler reported first since the last Take, as the tail of a status
+// message; empty when it said nothing.
+std::string SaidByPoppler(const PopplerErrorScope& errors) {
+  const std::string* first = errors.Find({});
+  return first != nullptr ? ": " + *first : std::string();
+}
+
+}  // namespace
+
 grpc::Status PopplerServiceImpl::RenderTo(
     grpc::ServerContext* context, const pdfv1::RenderRequest* request,
     const std::string* stream_bytes,
@@ -959,9 +971,9 @@ grpc::Status PopplerServiceImpl::RenderTo(
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
   }
   PopplerGate gate;
-  // RenderResponse has no place for warnings yet (grpc-poppler#18 tracks
-  // the contract addition); until it has, what poppler says while
-  // rendering goes to the log when this closes.
+  // What poppler says while it draws a page rides beside that page's
+  // raster (RenderResponse.warnings), so a partly drawn page is not handed
+  // out as a whole one.
   PopplerErrorScope engine_errors;
   LoadedDocument loaded;
   if (resolved.status == pdfv1::LOAD_STATUS_OK) {
@@ -984,6 +996,18 @@ grpc::Status PopplerServiceImpl::RenderTo(
 
   const auto [begin, end] = SelectPages(request->has_pages(), request->pages(),
                                         loaded.doc->pages());
+  // What loading and counting the pages said is about the document, not a
+  // page: Parse carries it in its trailer. Render's warnings are about the
+  // raster they ride with, so here it goes to the log, and stays off the
+  // first page.
+  {
+    std::vector<pdfv1::ParseWarning> load_said;
+    engine_errors.Take(std::nullopt, std::nullopt, &load_said);
+    for (const pdfv1::ParseWarning& said : load_said) {
+      std::fprintf(stderr, "grpc-poppler: Render: %s\n",
+                   said.message().c_str());
+    }
+  }
 
   poppler::page_renderer renderer;
   renderer.set_image_format(poppler::image::format_bgr24);
@@ -997,7 +1021,8 @@ grpc::Status PopplerServiceImpl::RenderTo(
       if (page == nullptr) {
         return grpc::Status(
             grpc::StatusCode::INTERNAL,
-            "poppler could not load page " + std::to_string(i));
+            "poppler could not load page " + std::to_string(i) +
+                SaidByPoppler(engine_errors));
       }
       // The raster's size is known before splash allocates it: the CropBox
       // at the requested dpi (rounded up here; splash rounds to nearest).
@@ -1017,7 +1042,8 @@ grpc::Status PopplerServiceImpl::RenderTo(
       if (!image.is_valid()) {
         return grpc::Status(
             grpc::StatusCode::INTERNAL,
-            "poppler could not render page " + std::to_string(i));
+            "poppler could not render page " + std::to_string(i) +
+                SaidByPoppler(engine_errors));
       }
       auto* raster = msg.mutable_raster();
       raster->set_page_index(static_cast<uint32_t>(i));
@@ -1029,6 +1055,12 @@ grpc::Status PopplerServiceImpl::RenderTo(
       raster->set_pixels(image.const_data(),
                          static_cast<size_t>(image.bytes_per_row()) *
                              image.height());
+      std::vector<pdfv1::ParseWarning> said;
+      engine_errors.Take(static_cast<uint32_t>(i),
+                         pdfv1::PDF_FAMILY_PAGE_RASTER, &said);
+      for (pdfv1::ParseWarning& warning : said) {
+        *msg.add_warnings() = std::move(warning);
+      }
     }
     if (!WriteUngated(gate, writer, msg)) return grpc::Status::OK;
   }

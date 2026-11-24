@@ -965,6 +965,74 @@ int main(int argc, char** argv) {
           "a clean document parses without warnings");
   }
 
+  // Render says the same things beside the raster they are about: poppler
+  // draws damaged_content.pdf's page 1 without the operator it did not
+  // know and page 2 without its undecodable content, and each raster
+  // carries what poppler reported, on its page and the raster family. The
+  // clean page's raster, and a clean document's, carry nothing.
+  {
+    auto render_warned = [](pdfv1::PdfBackendService::Stub& target,
+                            const std::string& data, grpc::Status* status) {
+      std::map<uint32_t, std::vector<pdfv1::ParseWarning>> by_raster;
+      grpc::ClientContext ctx;
+      SetDeadline(&ctx);
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(data);
+      request.set_dpi(36.0);
+      request.set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
+      auto reader = target.Render(&ctx, request);
+      pdfv1::RenderResponse msg;
+      while (reader->Read(&msg)) {
+        if (!msg.has_raster()) continue;
+        by_raster[msg.raster().page_index()].assign(msg.warnings().begin(),
+                                                    msg.warnings().end());
+      }
+      *status = reader->Finish();
+      return by_raster;
+    };
+    grpc::Status status;
+    const auto damaged = render_warned(*stub, damaged_content, &status);
+    Check(status.ok() && damaged.size() == 3,
+          "damaged_content.pdf renders to the end, all three pages");
+    if (damaged.size() == 3) {
+      Check(damaged.at(0).empty(), "the clean page's raster carries no warning");
+      bool operator_named = false;
+      bool stamped = !damaged.at(1).empty() && !damaged.at(2).empty();
+      for (uint32_t page : {1u, 2u}) {
+        for (const auto& warning : damaged.at(page)) {
+          if (!warning.has_page_index() || warning.page_index() != page ||
+              warning.family() != pdfv1::PDF_FAMILY_PAGE_RASTER ||
+              warning.message().rfind("poppler ", 0) != 0) {
+            stamped = false;
+          }
+          if (page == 1 &&
+              warning.message().find("bogusop") != std::string::npos) {
+            operator_named = true;
+          }
+        }
+      }
+      Check(operator_named,
+            "page 1's raster names the operator poppler did not know");
+      Check(stamped,
+            "both damaged pages' rasters carry poppler's messages, on their "
+            "page and the raster family");
+    }
+    const auto clean = render_warned(*stub, hello, &status);
+    Check(status.ok() && clean.size() == 1 && clean.at(0).empty(),
+          "a clean document's raster carries no warning");
+
+    // What poppler says while it loads is the document's, and Parse's to
+    // tell: it does not land on the first raster.
+    std::string wrong_xref = hello;
+    const size_t table = wrong_xref.find("xref\n0 6\n");
+    if (table != std::string::npos) {
+      wrong_xref.replace(table + 9 + 2 * 20, 10, "0000000003");
+    }
+    const auto rebuilt = render_warned(*stub, wrong_xref, &status);
+    Check(status.ok() && rebuilt.size() == 1 && rebuilt.at(0).empty(),
+          "what loading said does not ride on a page's raster");
+  }
+
   // Render hello.pdf at 72 DPI: BGR24, the same surface gRParse consumes.
   {
     grpc::ClientContext ctx;
