@@ -37,15 +37,23 @@ std::string TextString(const GooString* text) {
 // A field value as text: a text string decoded from PDFDocEncoding or
 // UTF-16, a name without its slash (the state name, as PDFium reports a
 // button value, made valid UTF-8 since a PDF name is raw bytes), the first
-// entry of a multi-selection array.
-std::optional<std::string> ValueText(const Object& value) {
+// entry of a multi-selection array. *selected, when given, is set to how
+// many text entries such an array has: FormField.value holds one.
+std::optional<std::string> ValueText(const Object& value,
+                                     int* selected = nullptr) {
   if (value.isString()) return PdfTextStringToUtf8(value.getString());
   if (value.isName()) return ValidUtf8(value.getName());
   if (value.isArray()) {
+    std::optional<std::string> first;
+    int entries = 0;
     for (int i = 0; i < value.arrayGetLength(); ++i) {
       const Object entry = value.arrayGet(i, 0);
-      if (entry.isString()) return PdfTextStringToUtf8(entry.getString());
+      if (!entry.isString()) continue;
+      if (!first.has_value()) first = PdfTextStringToUtf8(entry.getString());
+      ++entries;
     }
+    if (selected != nullptr) *selected = entries;
+    return first;
   }
   return std::nullopt;
 }
@@ -77,8 +85,9 @@ pdfv1::FormFieldKind Kind(FormWidget* widget) {
 
 // (cx, cy) is the CropBox's bottom-left corner: the rect is reported
 // relative to it, the contract's page space.
+// *selected is set to the number of values a multi-selection holds.
 void FillField(FormWidget* widget, double cx, double cy,
-               pdfv1::FormField* field) {
+               pdfv1::FormField* field, int* selected) {
   field->set_kind(Kind(widget));
   field->set_name(TextString(widget->getFullyQualifiedName()));
 
@@ -94,7 +103,7 @@ void FillField(FormWidget* widget, double cx, double cy,
   const uint32_t mask = flags.isInt() ? static_cast<uint32_t>(flags.getInt()) : 0;
   field->set_flags(mask);
   field->set_read_only((mask & kFieldFlagReadOnly) != 0);
-  if (auto value = ValueText(Form::fieldLookup(dict, "V"))) {
+  if (auto value = ValueText(Form::fieldLookup(dict, "V"), selected)) {
     if (!value->empty()) field->set_value(std::move(*value));
   }
   if (auto value = ValueText(Form::fieldLookup(dict, "DV"))) {
@@ -133,10 +142,10 @@ void FillField(FormWidget* widget, double cx, double cy,
 
 }  // namespace
 
-std::map<int, std::vector<pdfv1::FormField>> ReadFormFields(
-    const std::string& data, const std::optional<std::string>& password, int begin,
-    int end) {
-  std::map<int, std::vector<pdfv1::FormField>> out;
+FormFieldsRead ReadFormFields(const std::string& data,
+                              const std::optional<std::string>& password,
+                              int begin, int end) {
+  FormFieldsRead out;
   // Keeps globalParams alive for the core document, and sends what poppler
   // reports to the caller's PopplerErrorScope (src/poppler_errors.h).
   EnsurePopplerErrorCapture();
@@ -151,7 +160,10 @@ std::map<int, std::vector<pdfv1::FormField>> ReadFormFields(
                                          static_cast<Goffset>(data.size()),
                                          Object::null()),
              owner, user);
-  if (!doc.isOk()) return out;
+  if (!doc.isOk()) {
+    out.document_unreadable = true;
+    return out;
+  }
   const int pages = doc.getNumPages();
   for (int index = std::max(begin, 0); index < end && index < pages; ++index) {
     Page* page = doc.getPage(index + 1);
@@ -164,7 +176,12 @@ std::map<int, std::vector<pdfv1::FormField>> ReadFormFields(
     for (int w = 0; w < widgets->getNumWidgets(); ++w) {
       FormWidget* widget = widgets->getWidget(w);
       if (widget == nullptr) continue;
-      FillField(widget, crop.x1, crop.y1, &out[index].emplace_back());
+      pdfv1::FormField& field = out.fields[index].emplace_back();
+      int selected = 0;
+      FillField(widget, crop.x1, crop.y1, &field, &selected);
+      if (selected > 1) {
+        out.multiple_selections.push_back({index, field.name(), selected});
+      }
     }
   }
   return out;

@@ -52,11 +52,18 @@ enum class AttachmentsRead {
 // they pass the cap, so a stream that inflates without bound costs at most
 // the cap plus one block. A stream whose decoder will not start is
 // kUndecodable; one poppler stops decoding part way ends early, as at its
-// end, so the caller compares the bytes with the declared size.
+// end, so the caller compares the bytes with the declared size. The
+// creation and modification dates are carried as stored and the MD5
+// checksum as its 16 raw bytes, when /Params has them.
+//
+// A file spec poppler rejects (no /EF stream it can use) is not passed to
+// emit; rejected_specs counts them, so the caller can say how many
+// embedded files are missing from the list.
 AttachmentsRead ReadAttachments(
     const std::string& data, const std::optional<std::string>& password,
     std::optional<uint64_t> max_data_bytes,
     const std::function<bool(ai::protomolt::parse::pdf::v1::AttachmentMeta&&,
-                             AttachmentData)>& emit);
+                             AttachmentData)>& emit,
+    int* rejected_specs);
 
 }  // namespace grpc_poppler

@@ -23,12 +23,27 @@ namespace grpc_poppler {
 // /Parent chain; /AS is read from the widget annotation alone, keeping the
 // leading slash of the PDF name, as docling-core's PdfWidget does.
 //
-// An empty map means no page in the range has a widget or the core
-// document could not be opened (the caller already loaded the document
-// through poppler-cpp, so the second open only fails on the same bytes for
-// reasons that would have failed the first).
-std::map<int, std::vector<ai::protomolt::parse::pdf::v1::FormField>>
-ReadFormFields(const std::string& data, const std::optional<std::string>& password,
-               int begin, int end);
+// With document_unreadable set, the core document could not be opened and
+// no field was read: the caller says so, since an empty map alone reads as
+// a document without fields.
+//
+// A list box with several options selected stores them as an array;
+// FormField.value is one string and carries the first, and each such field
+// is listed in multiple_selections so the caller can say the others are
+// missing.
+struct FormFieldsRead {
+  struct MultipleSelection {
+    int page_index = 0;
+    std::string field_name;
+    int selected = 0;
+  };
+  std::map<int, std::vector<ai::protomolt::parse::pdf::v1::FormField>> fields;
+  std::vector<MultipleSelection> multiple_selections;
+  bool document_unreadable = false;
+};
+
+FormFieldsRead ReadFormFields(const std::string& data,
+                              const std::optional<std::string>& password,
+                              int begin, int end);
 
 }  // namespace grpc_poppler

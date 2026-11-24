@@ -162,7 +162,9 @@ add_executable(grpc_poppler
   src/poppler_forms.cpp
   src/poppler_attachments.cpp
   src/poppler_errors.cpp
+  src/poppler_document_facts.cpp
   src/poppler_load.cpp
+  src/poppler_render.cpp
   src/utf8.cpp
   src/document_cache.cpp
   src/sha256.cpp)
@@ -180,7 +182,9 @@ add_executable(poppler_contract_test
   src/poppler_forms.cpp
   src/poppler_attachments.cpp
   src/poppler_errors.cpp
+  src/poppler_document_facts.cpp
   src/poppler_load.cpp
+  src/poppler_render.cpp
   src/utf8.cpp
   src/document_cache.cpp
   src/sha256.cpp)

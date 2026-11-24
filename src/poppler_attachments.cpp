@@ -52,7 +52,9 @@ bool ReadCapped(Stream* stream, uint64_t max_bytes, std::string* out) {
 AttachmentsRead ReadAttachments(
     const std::string& data, const std::optional<std::string>& password,
     std::optional<uint64_t> max_data_bytes,
-    const std::function<bool(pdfv1::AttachmentMeta&&, AttachmentData)>& emit) {
+    const std::function<bool(pdfv1::AttachmentMeta&&, AttachmentData)>& emit,
+    int* rejected_specs) {
+  *rejected_specs = 0;
   // Keeps globalParams alive for the core document, and sends what poppler
   // reports to the caller's PopplerErrorScope (src/poppler_errors.h).
   EnsurePopplerErrorCapture();
@@ -72,7 +74,10 @@ AttachmentsRead ReadAttachments(
   const int files = catalog->numEmbeddedFiles();
   for (int i = 0; i < files; ++i) {
     std::unique_ptr<FileSpec> spec = catalog->embeddedFile(i);
-    if (spec == nullptr || !spec->isOk()) continue;
+    if (spec == nullptr || !spec->isOk()) {
+      ++*rejected_specs;
+      continue;
+    }
     pdfv1::AttachmentMeta meta;
     meta.set_name(TextString(spec->getFileName()));
     if (std::string description = TextString(spec->getDescription());
@@ -90,6 +95,18 @@ AttachmentsRead ReadAttachments(
       if (const GooString* mime = file->mimeType();
           mime != nullptr && !mime->toStr().empty()) {
         meta.set_mime_type(ValidUtf8(mime->toStr()));
+      }
+      if (std::string created = TextString(file->createDate());
+          !created.empty()) {
+        meta.set_created_raw(std::move(created));
+      }
+      if (std::string modified = TextString(file->modDate());
+          !modified.empty()) {
+        meta.set_modified_raw(std::move(modified));
+      }
+      if (const GooString* checksum = file->checksum();
+          checksum != nullptr && !checksum->toStr().empty()) {
+        meta.set_checksum_md5(checksum->toStr());
       }
       Stream* stream = file->stream();
       if (max_data_bytes.has_value() && stream != nullptr) {

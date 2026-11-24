@@ -50,6 +50,16 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   another callback (`poppler::set_debug_error_function`, a
   `GlobalParamsIniter` with a lambda): the core API readers call
   `EnsurePopplerErrorCapture` instead.
+- **What poppler-cpp does not expose comes from the core API**, through a
+  second core document over the same bytes: form fields
+  (`src/poppler_forms.cpp`), embedded files (`src/poppler_attachments.cpp`),
+  tagged / `/Trapped` / custom info keys / the encryption dictionary / the
+  outline with its targets (`src/poppler_document_facts.cpp`), and a page
+  rendered without its annotations (`src/poppler_render.cpp`, which must
+  keep the splash set-up of poppler-cpp's `page_renderer::render_page`).
+  Each reader reports "could not open" as a typed result and the handler
+  turns it into a `ParseWarning` or a failed status; none returns an empty
+  result for it.
 - **The content-addressed handshake** (`PdfDocument.sha256`) is served from
   an in-process LRU byte cache (`src/document_cache.h`), resolved once for
   all three RPCs in `ResolveDocumentBytes` (`src/poppler_service_impl.cpp`).
