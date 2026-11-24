@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -25,9 +26,11 @@
 
 #include "document_cache.h"
 #include "poppler_attachments.h"
+#include "poppler_document_facts.h"
 #include "poppler_errors.h"
 #include "poppler_forms.h"
 #include "poppler_load.h"
+#include "poppler_render.h"
 #include "sha256.h"
 #include "utf8.h"
 
@@ -524,13 +527,20 @@ pdfv1::FontKind MapFontKind(poppler::font_info::type_enum type) {
   }
 }
 
+// The outline from the cpp wrapper, titles only: what is left when the
+// core API cannot open the document (src/poppler_document_facts.h reads
+// the outline with its targets). *cut is set when items nested deeper than
+// kMaxOutlineDepth were left out.
 void FillOutlineItem(const poppler::toc_item* item, pdfv1::OutlineNode* node,
-                     int depth, uint64_t* count) {
+                     int depth, uint64_t* count, bool* cut) {
   node->set_title(ToUtf8(item->title()));
   ++*count;
-  if (depth >= 64) return;
+  if (depth + 1 >= kMaxOutlineDepth) {
+    if (!item->children().empty()) *cut = true;
+    return;
+  }
   for (const poppler::toc_item* child : item->children()) {
-    FillOutlineItem(child, node->add_children(), depth + 1, count);
+    FillOutlineItem(child, node->add_children(), depth + 1, count, cut);
   }
 }
 
@@ -658,8 +668,33 @@ grpc::Status PopplerServiceImpl::ParseTo(
   counts[pdfv1::PDF_FAMILY_PAGE_INVENTORY] =
       static_cast<uint64_t>(header->pages_size());
 
+  // What poppler-cpp does not expose (whether the document is tagged, the
+  // info keys that are not text, the encryption dictionary, the outline's
+  // targets) comes from poppler's core API (src/poppler_document_facts.h),
+  // read once for the families that need it.
+  const bool want_meta = WantFamily(*request, pdfv1::PDF_FAMILY_DOC_METADATA);
+  const bool want_encryption =
+      loaded.doc->is_encrypted() &&
+      WantFamily(*request, pdfv1::PDF_FAMILY_ENCRYPTION_INFO);
+  const bool want_outline = WantFamily(*request, pdfv1::PDF_FAMILY_OUTLINE);
+  DocumentFacts facts;
+  if (want_meta || want_encryption || want_outline) {
+    facts = ReadDocumentFacts(*resolved.bytes,
+                              DocumentPassword(request->document()),
+                              want_outline);
+    // The reader opens the bytes a second time, so what the load said is
+    // not said again.
+    engine_errors.TakeAfterReopen(std::nullopt, std::nullopt, &warnings);
+  }
+  const auto warn_unreadable = [&](pdfv1::PdfFamily family, const char* lost) {
+    pdfv1::ParseWarning& warning = warnings.emplace_back();
+    warning.set_family(family);
+    warning.set_message(
+        std::string("poppler's core API could not open the document; ") + lost);
+  };
+
   // Document-level families.
-  if (WantFamily(*request, pdfv1::PDF_FAMILY_DOC_METADATA)) {
+  if (want_meta) {
     pdfv1::ParseResponse msg;
     auto* meta = msg.mutable_doc_meta();
     auto set_if = [](const std::string& v, auto setter) {
@@ -691,15 +726,49 @@ grpc::Status PopplerServiceImpl::ParseTo(
                             std::to_string(minor));
     }
     if (loaded.doc->is_linearized()) meta->set_linearized(true);
+    if (facts.readable) {
+      meta->set_tagged(facts.tagged);
+      if (facts.trapped.has_value()) meta->set_trapped(*facts.trapped);
+      for (const auto& [key, value] : facts.custom_info) {
+        auto* entry = meta->add_custom();
+        entry->set_key(key);
+        entry->set_value(value);
+      }
+      for (const std::string& key : facts.info_not_carried) {
+        pdfv1::ParseWarning& warning = warnings.emplace_back();
+        warning.set_family(pdfv1::PDF_FAMILY_DOC_METADATA);
+        warning.set_message("info key " + key +
+                            " is not carried: its value is not text, a "
+                            "name, a number or a boolean");
+      }
+    } else {
+      warn_unreadable(pdfv1::PDF_FAMILY_DOC_METADATA,
+                      "whether it is tagged, /Trapped and the nonstandard "
+                      "info keys are not reported");
+    }
     ++counts[pdfv1::PDF_FAMILY_DOC_METADATA];
     engine_errors.Take(std::nullopt, pdfv1::PDF_FAMILY_DOC_METADATA,
                        &warnings);
     client_ok = WriteUngated(gate, writer, msg);
   }
-  if (client_ok && loaded.doc->is_encrypted() &&
-      WantFamily(*request, pdfv1::PDF_FAMILY_ENCRYPTION_INFO)) {
+  if (client_ok && want_encryption) {
     pdfv1::ParseResponse msg;
     auto* enc = msg.mutable_encryption();
+    if (facts.readable && facts.encryption.has_value()) {
+      const EncryptionFacts& stored = *facts.encryption;
+      if (stored.filter.has_value()) enc->set_filter(*stored.filter);
+      if (stored.revision.has_value()) enc->set_revision(*stored.revision);
+      if (stored.key_length_bits.has_value()) {
+        enc->set_key_length_bits(*stored.key_length_bits);
+      }
+      if (stored.permissions_raw.has_value()) {
+        enc->set_permissions_raw(*stored.permissions_raw);
+      }
+    } else {
+      warn_unreadable(pdfv1::PDF_FAMILY_ENCRYPTION_INFO,
+                      "the handler, its revision, the key length and the raw "
+                      "permissions are not reported");
+    }
     enc->set_can_print(loaded.doc->has_permission(poppler::perm_print));
     enc->set_can_modify(loaded.doc->has_permission(poppler::perm_change));
     enc->set_can_copy(loaded.doc->has_permission(poppler::perm_copy));
@@ -716,16 +785,45 @@ grpc::Status PopplerServiceImpl::ParseTo(
                        &warnings);
     client_ok = WriteUngated(gate, writer, msg);
   }
-  if (client_ok && WantFamily(*request, pdfv1::PDF_FAMILY_OUTLINE)) {
+  if (client_ok && want_outline && facts.readable) {
+    if (facts.outline_cut) {
+      pdfv1::ParseWarning& warning = warnings.emplace_back();
+      warning.set_family(pdfv1::PDF_FAMILY_OUTLINE);
+      warning.set_message("outline items nested deeper than " +
+                          std::to_string(kMaxOutlineDepth) +
+                          " levels are left out");
+    }
+    if (!facts.outline.empty()) {
+      pdfv1::ParseResponse msg;
+      auto* chunk = msg.mutable_outline();
+      for (pdfv1::OutlineNode& root : facts.outline) {
+        *chunk->add_roots() = std::move(root);
+      }
+      counts[pdfv1::PDF_FAMILY_OUTLINE] += facts.outline_nodes;
+      client_ok = WriteUngated(gate, writer, msg);
+    }
+  } else if (client_ok && want_outline) {
+    // The cpp wrapper still has the titles, without their targets.
+    warn_unreadable(pdfv1::PDF_FAMILY_OUTLINE,
+                    "outline items carry their titles only, no destination "
+                    "or URI");
     std::unique_ptr<poppler::toc> toc(loaded.doc->create_toc());
     engine_errors.Take(std::nullopt, pdfv1::PDF_FAMILY_OUTLINE, &warnings);
     if (toc != nullptr && toc->root() != nullptr &&
         !toc->root()->children().empty()) {
       pdfv1::ParseResponse msg;
       auto* chunk = msg.mutable_outline();
+      bool cut = false;
       for (const poppler::toc_item* item : toc->root()->children()) {
         FillOutlineItem(item, chunk->add_roots(), 0,
-                        &counts[pdfv1::PDF_FAMILY_OUTLINE]);
+                        &counts[pdfv1::PDF_FAMILY_OUTLINE], &cut);
+      }
+      if (cut) {
+        pdfv1::ParseWarning& warning = warnings.emplace_back();
+        warning.set_family(pdfv1::PDF_FAMILY_OUTLINE);
+        warning.set_message("outline items nested deeper than " +
+                            std::to_string(kMaxOutlineDepth) +
+                            " levels are left out");
       }
       client_ok = WriteUngated(gate, writer, msg);
     }
@@ -739,6 +837,7 @@ grpc::Status PopplerServiceImpl::ParseTo(
     if (request->options().include_attachment_data()) {
       max_data_bytes = limits_.max_attachment_bytes;
     }
+    int rejected_specs = 0;
     const AttachmentsRead read = ReadAttachments(
         *resolved.bytes, DocumentPassword(request->document()), max_data_bytes,
         [&](pdfv1::AttachmentMeta&& meta, AttachmentData data) {
@@ -784,11 +883,19 @@ grpc::Status PopplerServiceImpl::ParseTo(
           *msg.mutable_attachment() = std::move(meta);
           ++counts[pdfv1::PDF_FAMILY_ATTACHMENTS];
           return WriteUngated(gate, writer, msg);
-        });
+        },
+        &rejected_specs);
     // The reader opens the bytes a second time, so what the load said is
     // not said again.
     engine_errors.TakeAfterReopen(std::nullopt, pdfv1::PDF_FAMILY_ATTACHMENTS,
                                   &warnings);
+    if (rejected_specs > 0) {
+      pdfv1::ParseWarning& warning = warnings.emplace_back();
+      warning.set_family(pdfv1::PDF_FAMILY_ATTACHMENTS);
+      warning.set_message(std::to_string(rejected_specs) +
+                          " embedded file(s) have a file specification "
+                          "poppler rejects and are not listed");
+    }
     switch (read) {
       case AttachmentsRead::kDone:
         break;
@@ -812,8 +919,13 @@ grpc::Status PopplerServiceImpl::ParseTo(
   if (client_ok && want_fonts) {
     pdfv1::ParseResponse msg;
     auto* chunk = msg.mutable_fonts();
+    uint64_t unnamed = 0;
     for (const poppler::font_info& info : loaded.doc->fonts()) {
-      if (info.name().empty()) continue;
+      // Font ids are keyed by name, so a font without one has no entry.
+      if (info.name().empty()) {
+        ++unnamed;
+        continue;
+      }
       bool is_new = false;
       uint32_t id = fonts.Intern(info.name(), &is_new);
       if (!is_new) continue;
@@ -827,6 +939,12 @@ grpc::Status PopplerServiceImpl::ParseTo(
       ref->set_embedded(info.is_embedded());
     }
     engine_errors.Take(std::nullopt, pdfv1::PDF_FAMILY_FONTS, &warnings);
+    if (unnamed > 0) {
+      pdfv1::ParseWarning& warning = warnings.emplace_back();
+      warning.set_family(pdfv1::PDF_FAMILY_FONTS);
+      warning.set_message(std::to_string(unnamed) +
+                          " font(s) without a name are not in the font table");
+    }
     if (chunk->fonts_size() > 0) {
       counts[pdfv1::PDF_FAMILY_FONTS] +=
           static_cast<uint64_t>(chunk->fonts_size());
@@ -843,11 +961,25 @@ grpc::Status PopplerServiceImpl::ParseTo(
   // cpp wrapper has no forms surface.
   std::map<int, std::vector<pdfv1::FormField>> form_fields;
   if (want_fields) {
-    form_fields = ReadFormFields(*resolved.bytes,
-                                 DocumentPassword(request->document()), begin,
-                                 end);
+    FormFieldsRead read = ReadFormFields(
+        *resolved.bytes, DocumentPassword(request->document()), begin, end);
     engine_errors.TakeAfterReopen(std::nullopt, pdfv1::PDF_FAMILY_FORM_FIELDS,
                                   &warnings);
+    if (read.document_unreadable) {
+      warn_unreadable(pdfv1::PDF_FAMILY_FORM_FIELDS,
+                      "its form fields are not listed");
+    }
+    for (const FormFieldsRead::MultipleSelection& multiple :
+         read.multiple_selections) {
+      pdfv1::ParseWarning& warning = warnings.emplace_back();
+      warning.set_page_index(static_cast<uint32_t>(multiple.page_index));
+      warning.set_family(pdfv1::PDF_FAMILY_FORM_FIELDS);
+      warning.set_message("form field \"" + multiple.field_name + "\" has " +
+                          std::to_string(multiple.selected) +
+                          " selected values; FormField.value carries the "
+                          "first only");
+    }
+    form_fields = std::move(read.fields);
   }
   // Page chunks carry only page-level families; a request for none of them
   // gets no chunks.
@@ -859,6 +991,9 @@ grpc::Status PopplerServiceImpl::ParseTo(
     pdfv1::ParseResponse page_msg;
     auto* chunk = page_msg.mutable_page();
     chunk->set_page_index(static_cast<uint32_t>(i));
+    // The page's fonts as poppler lists them, read the first time a cell
+    // shows a font the stream has not announced.
+    std::optional<std::vector<poppler::font_info>> page_fonts;
     if (want_text) {
       const TextFrame frame(*page);
       const auto boxes =
@@ -888,6 +1023,37 @@ grpc::Status PopplerServiceImpl::ParseTo(
               auto* ref = fonts_msg.mutable_fonts()->add_fonts();
               ref->set_font_id(id);
               ref->set_base_name(ValidUtf8(name));
+              // FontRef.embedded is a plain bool, so an entry with the
+              // name alone would read as "not embedded": the kind and the
+              // embedding come from the page's own font list.
+              if (!page_fonts.has_value()) {
+                std::unique_ptr<poppler::font_iterator> on_page(
+                    loaded.doc->create_font_iterator(i));
+                page_fonts.emplace();
+                if (on_page != nullptr && on_page->has_next()) {
+                  *page_fonts = on_page->next();
+                }
+                engine_errors.Take(static_cast<uint32_t>(i),
+                                   pdfv1::PDF_FAMILY_FONTS, &warnings);
+              }
+              bool described = false;
+              for (const poppler::font_info& info : *page_fonts) {
+                if (info.name() != name) continue;
+                ref->set_kind(MapFontKind(info.type()));
+                ref->set_embedded(info.is_embedded());
+                described = true;
+                break;
+              }
+              if (!described) {
+                pdfv1::ParseWarning& warning = warnings.emplace_back();
+                warning.set_page_index(static_cast<uint32_t>(i));
+                warning.set_family(pdfv1::PDF_FAMILY_FONTS);
+                warning.set_message(
+                    "font \"" + ValidUtf8(name) +
+                    "\" is used by text on this page and is not in "
+                    "poppler's font list for it; its kind and whether it is "
+                    "embedded are not known");
+              }
               ++counts[pdfv1::PDF_FAMILY_FONTS];
               client_ok = WriteUngated(gate, writer, fonts_msg);
               if (!client_ok) break;
@@ -929,6 +1095,17 @@ grpc::Status PopplerServiceImpl::Render(
   return RenderTo(context, request, nullptr, &sink);
 }
 
+namespace {
+
+// What poppler reported first since the last Take, as the tail of a status
+// message; empty when it said nothing.
+std::string SaidByPoppler(const PopplerErrorScope& errors) {
+  const std::string* first = errors.Find({});
+  return first != nullptr ? ": " + *first : std::string();
+}
+
+}  // namespace
+
 grpc::Status PopplerServiceImpl::RenderTo(
     grpc::ServerContext* context, const pdfv1::RenderRequest* request,
     const std::string* stream_bytes,
@@ -952,6 +1129,27 @@ grpc::Status PopplerServiceImpl::RenderTo(
       return range;
     }
   }
+  // The page's paper: the request's background laid over white, since a
+  // raster carries no transparency; white when the request sets none.
+  uint32_t paper = 0xffffff;
+  if (request->has_background()) {
+    const pdfv1::Color& color = request->background();
+    for (const double component :
+         {color.red(), color.green(), color.blue(), color.alpha()}) {
+      if (!std::isfinite(component)) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "background components must be finite numbers");
+      }
+    }
+    const double alpha = std::clamp(color.alpha(), 0.0, 1.0);
+    const auto channel = [alpha](double component) {
+      const double over_white =
+          std::clamp(component, 0.0, 1.0) * alpha + (1.0 - alpha);
+      return static_cast<uint32_t>(std::lround(over_white * 255.0));
+    };
+    paper = (channel(color.red()) << 16) | (channel(color.green()) << 8) |
+            channel(color.blue());
+  }
   const ResolvedBytes resolved =
       stream_bytes != nullptr ? StreamBytes(stream_bytes)
                               : ResolveDocumentBytes(request->document(), cache_);
@@ -959,9 +1157,9 @@ grpc::Status PopplerServiceImpl::RenderTo(
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, resolved.detail);
   }
   PopplerGate gate;
-  // RenderResponse has no place for warnings yet (grpc-poppler#18 tracks
-  // the contract addition); until it has, what poppler says while
-  // rendering goes to the log when this closes.
+  // What poppler says while it draws a page rides beside that page's
+  // raster (RenderResponse.warnings), so a partly drawn page is not handed
+  // out as a whole one.
   PopplerErrorScope engine_errors;
   LoadedDocument loaded;
   if (resolved.status == pdfv1::LOAD_STATUS_OK) {
@@ -984,9 +1182,22 @@ grpc::Status PopplerServiceImpl::RenderTo(
 
   const auto [begin, end] = SelectPages(request->has_pages(), request->pages(),
                                         loaded.doc->pages());
+  // What loading and counting the pages said is about the document, not a
+  // page: Parse carries it in its trailer. Render's warnings are about the
+  // raster they ride with, so here it goes to the log, and stays off the
+  // first page.
+  {
+    std::vector<pdfv1::ParseWarning> load_said;
+    engine_errors.Take(std::nullopt, std::nullopt, &load_said);
+    for (const pdfv1::ParseWarning& said : load_said) {
+      std::fprintf(stderr, "grpc-poppler: Render: %s\n",
+                   said.message().c_str());
+    }
+  }
 
   poppler::page_renderer renderer;
   renderer.set_image_format(poppler::image::format_bgr24);
+  renderer.set_paper_color(0xff000000u | paper);
   for (int i = begin; i < end; ++i) {
     if (context->IsCancelled()) return grpc::Status::CANCELLED;
     pdfv1::RenderResponse msg;
@@ -997,7 +1208,8 @@ grpc::Status PopplerServiceImpl::RenderTo(
       if (page == nullptr) {
         return grpc::Status(
             grpc::StatusCode::INTERNAL,
-            "poppler could not load page " + std::to_string(i));
+            "poppler could not load page " + std::to_string(i) +
+                SaidByPoppler(engine_errors));
       }
       // The raster's size is known before splash allocates it: the CropBox
       // at the requested dpi (rounded up here; splash rounds to nearest).
@@ -1013,22 +1225,51 @@ grpc::Status PopplerServiceImpl::RenderTo(
                 " pixels, above the limit of " +
                 std::to_string(limits_.max_raster_pixels));
       }
-      const poppler::image image = renderer.render_page(page.get(), dpi, dpi);
-      if (!image.is_valid()) {
-        return grpc::Status(
-            grpc::StatusCode::INTERNAL,
-            "poppler could not render page " + std::to_string(i));
-      }
       auto* raster = msg.mutable_raster();
-      raster->set_page_index(static_cast<uint32_t>(i));
-      raster->set_width_px(static_cast<uint32_t>(image.width()));
-      raster->set_height_px(static_cast<uint32_t>(image.height()));
-      raster->set_stride_bytes(static_cast<uint32_t>(image.bytes_per_row()));
-      raster->set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
-      raster->set_dpi(dpi);
-      raster->set_pixels(image.const_data(),
-                         static_cast<size_t>(image.bytes_per_row()) *
-                             image.height());
+      if (request->omit_annotations()) {
+        // poppler-cpp's renderer always draws annotations; the page goes
+        // through the core API instead (src/poppler_render.h).
+        switch (RenderWithoutAnnotations(*resolved.bytes,
+                                         DocumentPassword(request->document()),
+                                         i, dpi, paper, raster)) {
+          case CoreRender::kRendered:
+            break;
+          case CoreRender::kDocumentUnreadable:
+            return grpc::Status(
+                grpc::StatusCode::INTERNAL,
+                "poppler's core API could not open the document to render "
+                "page " + std::to_string(i) + " without its annotations" +
+                    SaidByPoppler(engine_errors));
+          case CoreRender::kFailed:
+            return grpc::Status(
+                grpc::StatusCode::INTERNAL,
+                "poppler could not render page " + std::to_string(i) +
+                    SaidByPoppler(engine_errors));
+        }
+      } else {
+        const poppler::image image = renderer.render_page(page.get(), dpi, dpi);
+        if (!image.is_valid()) {
+          return grpc::Status(
+              grpc::StatusCode::INTERNAL,
+              "poppler could not render page " + std::to_string(i) +
+                  SaidByPoppler(engine_errors));
+        }
+        raster->set_page_index(static_cast<uint32_t>(i));
+        raster->set_width_px(static_cast<uint32_t>(image.width()));
+        raster->set_height_px(static_cast<uint32_t>(image.height()));
+        raster->set_stride_bytes(static_cast<uint32_t>(image.bytes_per_row()));
+        raster->set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
+        raster->set_dpi(dpi);
+        raster->set_pixels(image.const_data(),
+                           static_cast<size_t>(image.bytes_per_row()) *
+                               image.height());
+      }
+      std::vector<pdfv1::ParseWarning> said;
+      engine_errors.Take(static_cast<uint32_t>(i),
+                         pdfv1::PDF_FAMILY_PAGE_RASTER, &said);
+      for (pdfv1::ParseWarning& warning : said) {
+        *msg.add_warnings() = std::move(warning);
+      }
     }
     if (!WriteUngated(gate, writer, msg)) return grpc::Status::OK;
   }

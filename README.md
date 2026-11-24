@@ -39,9 +39,21 @@ come from the core API too (`src/poppler_attachments.cpp`): the cpp wrapper
 cuts a UTF-16 file name at its first NUL byte and inflates a whole payload
 before handing it out, while the core file spec gives the raw name, decoded
 here as a PDF text string, and the stream, decoded block by block under a
-size cap (see Resource limits). The poppler build installs the core headers
-for this (`ENABLE_UNSTABLE_API_ABI_HEADERS`); the library is the one
-poppler-cpp already links. Annotations and the structure tree are still
+size cap (see Resource limits), with the file's dates and MD5 checksum when
+`/Params` has them. A third core reader (`src/poppler_document_facts.cpp`)
+fills what the cpp wrapper keeps to itself: whether the document is tagged,
+`/Trapped` and the info keys outside the standard set, the encryption
+dictionary's handler, revision, key length and raw permissions, and each
+outline item's target (a page destination, explicit or named, or a URI).
+`Render` honours `background` (the page's paper, laid over white when it is
+not opaque) and `omit_annotations`; the cpp renderer always draws
+annotations, so a page without them is drawn through the core API with the
+same splash set-up (`src/poppler_render.cpp`). The poppler build installs
+the core headers for this (`ENABLE_UNSTABLE_API_ABI_HEADERS`); the library
+is the one poppler-cpp already links. When a core reader cannot open the
+bytes, the family it feeds says so in a `ParseWarning` and does not report
+defaults. A form field with several selected values carries the first in
+`FormField.value`, which is one string, and a warning names the field. Annotations and the structure tree are still
 reported unsupported, each with the reason; deep graphics resources are not
 poppler's to give.
 
@@ -157,8 +169,13 @@ document-level ones. A page with such a warning may be missing text. The
 messages start with `poppler ` and its category (`syntax error`,
 `internal error`, ...); one that repeats is carried once with its count,
 and past 16 different messages for one piece of work the rest are counted,
-not listed. `Render` and `Probe` have no warning field in the contract
-yet, so what poppler says there goes to the service log.
+not listed. `Render` does the same beside each raster: what poppler
+reported while it drew a page rides in that message's
+`RenderResponse.warnings`, with the page's index and the `PAGE_RASTER`
+family, so a raster with warnings may be missing part of the page. What
+loading the document said is `Parse`'s to tell; in `Render` it goes to the
+service log, as everything poppler says in `Probe` does (the contract has
+no warning field there).
 
 A set `PageRange` must have `end` greater than `begin`, the contract's one
 rule for it; anything else is `INVALID_ARGUMENT`. An `end` past the

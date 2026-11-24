@@ -12,6 +12,7 @@
 // under a stalled client.
 
 #include <chrono>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -31,6 +32,7 @@
 
 #include "parse_stream_checks.h"
 #include "poppler_attachments.h"
+#include "poppler_forms.h"
 #include "poppler_service_impl.h"
 #include "sha256.h"
 
@@ -513,15 +515,222 @@ int main(int argc, char** argv) {
   // into a trailer warning.
   {
     int emitted = 0;
+    int rejected = 0;
     const grpc_poppler::AttachmentsRead read = grpc_poppler::ReadAttachments(
         "%PDF-1.7\nnot a document\n", std::nullopt, std::nullopt,
         [&emitted](pdfv1::AttachmentMeta&&, grpc_poppler::AttachmentData) {
           ++emitted;
           return true;
-        });
+        },
+        &rejected);
     Check(read == grpc_poppler::AttachmentsRead::kDocumentUnreadable &&
               emitted == 0,
           "an unreadable document is reported, not listed as empty");
+    // The form field reader opens the bytes the same way and says the same.
+    const grpc_poppler::FormFieldsRead fields = grpc_poppler::ReadFormFields(
+        "%PDF-1.7\nnot a document\n", std::nullopt, 0, 1);
+    Check(fields.document_unreadable && fields.fields.empty(),
+          "form fields of an unreadable document are reported, not listed as "
+          "none");
+  }
+
+  // What the cpp wrapper does not hand out comes from poppler's core API:
+  // whether the document is tagged, /Trapped and the info keys outside the
+  // standard set, the encryption dictionary, each outline item's target,
+  // an attachment's dates and checksum, and a font's kind and embedding
+  // when it is first met in a text cell.
+  {
+    struct Parsed {
+      grpc::Status status;
+      std::optional<pdfv1::DocMeta> meta;
+      std::optional<pdfv1::EncryptionInfo> encryption;
+      std::vector<pdfv1::OutlineNode> outline;
+      std::vector<pdfv1::AttachmentMeta> attachments;
+      std::map<std::string, pdfv1::FontRef> fonts;
+      std::vector<pdfv1::ParseWarning> warnings;
+    };
+    auto parse = [&stub](const std::string& data,
+                         std::vector<pdfv1::PdfFamily> families,
+                         std::optional<std::string> password) {
+      Parsed out;
+      grpc::ClientContext ctx;
+      SetDeadline(&ctx);
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(data);
+      if (password.has_value()) {
+        request.mutable_document()->set_password(*password);
+      }
+      for (const pdfv1::PdfFamily family : families) request.add_families(family);
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse msg;
+      while (reader->Read(&msg)) {
+        if (msg.has_doc_meta()) out.meta = msg.doc_meta();
+        if (msg.has_encryption()) out.encryption = msg.encryption();
+        if (msg.has_outline()) {
+          out.outline.assign(msg.outline().roots().begin(),
+                             msg.outline().roots().end());
+        }
+        if (msg.has_attachment()) out.attachments.push_back(msg.attachment());
+        if (msg.has_fonts()) {
+          for (const auto& font : msg.fonts().fonts()) {
+            out.fonts[font.base_name()] = font;
+          }
+        }
+        if (msg.has_trailer()) {
+          out.warnings.assign(msg.trailer().warnings().begin(),
+                              msg.trailer().warnings().end());
+        }
+      }
+      out.status = reader->Finish();
+      return out;
+    };
+    // Swaps one stretch of a fixture for another of the same length, so
+    // the cross-reference table stays right.
+    auto swapped = [](std::string data, const std::string& from,
+                      const std::string& to) {
+      const size_t at = data.find(from);
+      Check(at != std::string::npos && from.size() == to.size(),
+            "the fixture has the stretch to swap, and the swap keeps its length");
+      if (at != std::string::npos && from.size() == to.size()) {
+        data.replace(at, from.size(), to);
+      }
+      return data;
+    };
+
+    const Parsed rich_meta =
+        parse(rich, {pdfv1::PDF_FAMILY_DOC_METADATA}, std::nullopt);
+    Check(rich_meta.meta.has_value() && rich_meta.meta->tagged(),
+          "/MarkInfo /Marked true reads as tagged");
+    const Parsed hello_meta =
+        parse(hello, {pdfv1::PDF_FAMILY_DOC_METADATA}, std::nullopt);
+    Check(hello_meta.meta.has_value() && !hello_meta.meta->tagged() &&
+              hello_meta.warnings.empty(),
+          "a document without /MarkInfo is not tagged, and nothing is warned");
+    const Parsed custom = parse(
+        swapped(rich, "/Keywords (rich fixture families)",
+                "/Trapped /True /Dept (Records)   "),
+        {pdfv1::PDF_FAMILY_DOC_METADATA}, std::nullopt);
+    Check(custom.meta.has_value() && custom.meta->trapped() == "True" &&
+              custom.meta->custom_size() == 1 &&
+              custom.meta->custom(0).key() == "Dept" &&
+              custom.meta->custom(0).value() == "Records" &&
+              custom.meta->title() == "Rich Fixture",
+          "/Trapped and an info key outside the standard set are carried");
+
+    const Parsed locked =
+        parse(encrypted, {pdfv1::PDF_FAMILY_ENCRYPTION_INFO}, "user");
+    Check(locked.status.ok() && locked.encryption.has_value(),
+          "encrypted.pdf sends its EncryptionInfo");
+    if (locked.encryption.has_value()) {
+      Check(locked.encryption->filter() == "Standard" &&
+                locked.encryption->revision() == 2 &&
+                locked.encryption->key_length_bits() == 40 &&
+                locked.encryption->has_permissions_raw(),
+            "the handler, revision, key length and raw permissions are read");
+    }
+
+    const Parsed outlined = parse(rich, {pdfv1::PDF_FAMILY_OUTLINE}, std::nullopt);
+    Check(outlined.outline.size() == 2, "rich.pdf's outline has two items");
+    if (outlined.outline.size() == 2) {
+      const pdfv1::OutlineNode& chapter = outlined.outline[0];
+      Check(chapter.title() == "Chapter One" && chapter.has_destination() &&
+                chapter.destination().page_index() == 0 &&
+                Near(chapter.destination().x(), 72.0) &&
+                Near(chapter.destination().y(), 720.0) &&
+                Near(chapter.destination().zoom(), 1.5) && !chapter.has_uri(),
+            "an outline item carries its page destination");
+      const pdfv1::OutlineNode& site = outlined.outline[1];
+      Check(site.title() == "Project Site" &&
+                site.uri() == "https://example.com/site" &&
+                !site.has_destination(),
+            "an outline item carries its URI");
+    }
+
+    const Parsed attached =
+        parse(rich, {pdfv1::PDF_FAMILY_ATTACHMENTS}, std::nullopt);
+    Check(attached.attachments.size() == 1 &&
+              attached.attachments[0].created_raw() == "D:20260904090000Z" &&
+              !attached.attachments[0].has_checksum_md5(),
+          "an attachment carries its creation date as stored");
+    const Parsed summed = parse(
+        swapped(rich, "<< /Size 18 /CreationDate (D:20260904090000Z) >>",
+                "<</CheckSum<000102030405060708090a0b0c0d0e0f>>> "),
+        {pdfv1::PDF_FAMILY_ATTACHMENTS}, std::nullopt);
+    std::string md5;
+    for (int i = 0; i < 16; ++i) md5 += static_cast<char>(i);
+    Check(summed.attachments.size() == 1 &&
+              summed.attachments[0].checksum_md5() == md5,
+          "an attachment carries its MD5 checksum as raw bytes");
+    const Parsed rejected_spec =
+        parse(swapped(rich, "/EF << /F 22 0 R >>", "/EF << /F (220R) >>"),
+              {pdfv1::PDF_FAMILY_ATTACHMENTS}, std::nullopt);
+    bool rejection_said = false;
+    for (const auto& warning : rejected_spec.warnings) {
+      if (warning.family() == pdfv1::PDF_FAMILY_ATTACHMENTS &&
+          warning.message().find("1 embedded file(s)") != std::string::npos) {
+        rejection_said = true;
+      }
+    }
+    Check(rejected_spec.attachments.empty() && rejection_said,
+          "a file specification poppler rejects is warned about");
+
+    // FormField.value is one string: a field with several selected values
+    // carries the first, and the trailer says the others are missing.
+    {
+      grpc::ClientContext ctx;
+      SetDeadline(&ctx);
+      pdfv1::ParseRequest request;
+      request.mutable_document()->set_data(
+          swapped(rich, "/V (Jordan Example)", "/V [(Jordan)(Exam)]"));
+      request.add_families(pdfv1::PDF_FAMILY_FORM_FIELDS);
+      auto reader = stub->Parse(&ctx, request);
+      pdfv1::ParseResponse msg;
+      std::string value;
+      bool said = false;
+      while (reader->Read(&msg)) {
+        if (msg.has_page()) {
+          for (const auto& field : msg.page().form_fields()) {
+            if (field.name() == "customer_name") value = field.value();
+          }
+        }
+        if (msg.has_trailer()) {
+          for (const auto& warning : msg.trailer().warnings()) {
+            if (warning.family() == pdfv1::PDF_FAMILY_FORM_FIELDS &&
+                warning.page_index() == 0 &&
+                warning.message().find("customer_name") != std::string::npos &&
+                warning.message().find("2 selected values") !=
+                    std::string::npos) {
+              said = true;
+            }
+          }
+        }
+      }
+      Check(reader->Finish().ok() && value == "Jordan" && said,
+            "a field with several selected values says the others are "
+            "missing");
+    }
+
+    // A font first met in a text cell is announced as the document font
+    // table would announce it.
+    const Parsed with_table = parse(
+        rich, {pdfv1::PDF_FAMILY_FONTS, pdfv1::PDF_FAMILY_TEXT_CELLS},
+        std::nullopt);
+    const Parsed cells_only =
+        parse(rich, {pdfv1::PDF_FAMILY_TEXT_CELLS}, std::nullopt);
+    bool same = !cells_only.fonts.empty();
+    bool any_embedded = false;
+    for (const auto& [name, font] : cells_only.fonts) {
+      const auto listed = with_table.fonts.find(name);
+      if (listed == with_table.fonts.end() ||
+          listed->second.kind() != font.kind() ||
+          listed->second.embedded() != font.embedded() ||
+          font.kind() == pdfv1::FONT_KIND_UNSPECIFIED) {
+        same = false;
+      }
+      if (font.embedded()) any_embedded = true;
+    }
+    Check(same && any_embedded,
+          "a font first met in a text cell carries its kind and embedding");
   }
   // Under a 4 KiB cap the attachment that inflates to 64 KiB is listed
   // without its data and the trailer says why; the others are unaffected.
@@ -963,6 +1172,186 @@ int main(int argc, char** argv) {
     const Warned clean = parse_warned(*stub, hello, {});
     Check(clean.status.ok() && clean.warnings.empty(),
           "a clean document parses without warnings");
+  }
+
+  // Render says the same things beside the raster they are about: poppler
+  // draws damaged_content.pdf's page 1 without the operator it did not
+  // know and page 2 without its undecodable content, and each raster
+  // carries what poppler reported, on its page and the raster family. The
+  // clean page's raster, and a clean document's, carry nothing.
+  {
+    auto render_warned = [](pdfv1::PdfBackendService::Stub& target,
+                            const std::string& data, grpc::Status* status) {
+      std::map<uint32_t, std::vector<pdfv1::ParseWarning>> by_raster;
+      grpc::ClientContext ctx;
+      SetDeadline(&ctx);
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(data);
+      request.set_dpi(36.0);
+      request.set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
+      auto reader = target.Render(&ctx, request);
+      pdfv1::RenderResponse msg;
+      while (reader->Read(&msg)) {
+        if (!msg.has_raster()) continue;
+        by_raster[msg.raster().page_index()].assign(msg.warnings().begin(),
+                                                    msg.warnings().end());
+      }
+      *status = reader->Finish();
+      return by_raster;
+    };
+    grpc::Status status;
+    const auto damaged = render_warned(*stub, damaged_content, &status);
+    Check(status.ok() && damaged.size() == 3,
+          "damaged_content.pdf renders to the end, all three pages");
+    if (damaged.size() == 3) {
+      Check(damaged.at(0).empty(), "the clean page's raster carries no warning");
+      bool operator_named = false;
+      bool stamped = !damaged.at(1).empty() && !damaged.at(2).empty();
+      for (uint32_t page : {1u, 2u}) {
+        for (const auto& warning : damaged.at(page)) {
+          if (!warning.has_page_index() || warning.page_index() != page ||
+              warning.family() != pdfv1::PDF_FAMILY_PAGE_RASTER ||
+              warning.message().rfind("poppler ", 0) != 0) {
+            stamped = false;
+          }
+          if (page == 1 &&
+              warning.message().find("bogusop") != std::string::npos) {
+            operator_named = true;
+          }
+        }
+      }
+      Check(operator_named,
+            "page 1's raster names the operator poppler did not know");
+      Check(stamped,
+            "both damaged pages' rasters carry poppler's messages, on their "
+            "page and the raster family");
+    }
+    const auto clean = render_warned(*stub, hello, &status);
+    Check(status.ok() && clean.size() == 1 && clean.at(0).empty(),
+          "a clean document's raster carries no warning");
+
+    // What poppler says while it loads is the document's, and Parse's to
+    // tell: it does not land on the first raster.
+    std::string wrong_xref = hello;
+    const size_t table = wrong_xref.find("xref\n0 6\n");
+    if (table != std::string::npos) {
+      wrong_xref.replace(table + 9 + 2 * 20, 10, "0000000003");
+    }
+    const auto rebuilt = render_warned(*stub, wrong_xref, &status);
+    Check(status.ok() && rebuilt.size() == 1 && rebuilt.at(0).empty(),
+          "what loading said does not ride on a page's raster");
+  }
+
+  // Render honours the request's background and omit_annotations. The
+  // background is the page's paper, laid over white when it is not opaque.
+  // With omit_annotations the page's content is drawn pixel for pixel as
+  // before and its annotations are not: rich.pdf differs only inside the
+  // rectangles of the annotations poppler draws.
+  {
+    auto render = [&stub](const std::string& data,
+                          const std::function<void(pdfv1::RenderRequest*)>& set,
+                          grpc::Status* status) {
+      grpc::ClientContext ctx;
+      SetDeadline(&ctx);
+      pdfv1::RenderRequest request;
+      request.mutable_document()->set_data(data);
+      request.set_dpi(72.0);
+      request.set_pixel_format(pdfv1::PIXEL_FORMAT_BGR8);
+      set(&request);
+      auto reader = stub->Render(&ctx, request);
+      pdfv1::RenderResponse msg;
+      pdfv1::PageRaster raster;
+      while (reader->Read(&msg)) {
+        if (msg.has_raster()) raster = msg.raster();
+      }
+      *status = reader->Finish();
+      return raster;
+    };
+    auto pixel = [](const pdfv1::PageRaster& raster, uint32_t x, uint32_t y) {
+      std::array<int, 3> bgr = {-1, -1, -1};
+      const size_t at = size_t{y} * raster.stride_bytes() + size_t{x} * 3;
+      if (at + 2 < raster.pixels().size()) {
+        for (int c = 0; c < 3; ++c) {
+          bgr[static_cast<size_t>(c)] =
+              static_cast<unsigned char>(raster.pixels()[at + c]);
+        }
+      }
+      return bgr;
+    };
+    grpc::Status status;
+    const pdfv1::PageRaster plain =
+        render(rich, [](pdfv1::RenderRequest*) {}, &status);
+    Check(status.ok() && pixel(plain, 2, 2) == std::array<int, 3>{255, 255, 255},
+          "a page without a background sits on white");
+    const pdfv1::PageRaster red = render(
+        rich,
+        [](pdfv1::RenderRequest* request) {
+          request->mutable_background()->set_red(1.0);
+          request->mutable_background()->set_alpha(1.0);
+        },
+        &status);
+    Check(status.ok() && pixel(red, 2, 2) == std::array<int, 3>{0, 0, 255},
+          "an opaque background is the page's paper");
+    const pdfv1::PageRaster pink = render(
+        rich,
+        [](pdfv1::RenderRequest* request) {
+          request->mutable_background()->set_red(1.0);
+          request->mutable_background()->set_alpha(0.5);
+        },
+        &status);
+    Check(status.ok() && pixel(pink, 2, 2) == std::array<int, 3>{128, 128, 255},
+          "a translucent background is laid over white");
+    render(
+        rich,
+        [](pdfv1::RenderRequest* request) {
+          request->mutable_background()->set_red(std::nan(""));
+        },
+        &status);
+    Check(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "a background component that is not a number is refused");
+
+    const pdfv1::PageRaster bare = render(
+        rich,
+        [](pdfv1::RenderRequest* request) { request->set_omit_annotations(true); },
+        &status);
+    Check(status.ok() && bare.width_px() == plain.width_px() &&
+              bare.height_px() == plain.height_px() &&
+              bare.stride_bytes() == plain.stride_bytes() &&
+              bare.pixels().size() == plain.pixels().size(),
+          "omit_annotations renders the same raster size");
+    if (bare.pixels().size() == plain.pixels().size() && plain.width_px() > 0) {
+      // The /Rect of each annotation on the page, in points, bottom-up:
+      // highlight, text field, sticky note, check box, and the two links,
+      // whose borders poppler draws. One pixel a point at 72 dpi, with a
+      // margin for what poppler draws around a rect.
+      const std::array<std::array<int, 4>, 6> rects = {{{70, 640, 210, 660},
+                                                        {300, 300, 450, 320},
+                                                        {500, 700, 520, 720},
+                                                        {300, 250, 315, 265},
+                                                        {72, 700, 200, 740},
+                                                        {72, 660, 200, 690}}};
+      uint64_t differing = 0;
+      uint64_t outside = 0;
+      for (uint32_t y = 0; y < plain.height_px(); ++y) {
+        for (uint32_t x = 0; x < plain.width_px(); ++x) {
+          if (pixel(plain, x, y) == pixel(bare, x, y)) continue;
+          ++differing;
+          const int px = static_cast<int>(x);
+          const int py = static_cast<int>(plain.height_px() - y);
+          bool inside = false;
+          for (const auto& rect : rects) {
+            if (px >= rect[0] - 12 && px <= rect[2] + 12 &&
+                py >= rect[1] - 12 && py <= rect[3] + 12) {
+              inside = true;
+            }
+          }
+          if (!inside) ++outside;
+        }
+      }
+      Check(differing > 0, "omit_annotations leaves the annotations out");
+      Check(outside == 0,
+            "omit_annotations leaves the page's content as it was");
+    }
   }
 
   // Render hello.pdf at 72 DPI: BGR24, the same surface gRParse consumes.
