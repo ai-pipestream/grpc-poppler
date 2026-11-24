@@ -38,6 +38,16 @@ list for consensus mode via `GRPARSE_PDF_BACKEND`).
   `WriteUngated`, so a slow or stalled client cannot hold every other
   request behind it. Poppler objects are declared after the gate, so they
   are destroyed with it held. Page loops stop when the call is cancelled.
+- **poppler's error callback is ours** (`src/poppler_errors.h`). poppler
+  reports damage only through one process-wide callback;
+  `EnsurePopplerErrorCapture` installs it for good and a handler's
+  `PopplerErrorScope` collects what is said on its thread. Every piece of
+  poppler work in `ParseTo` is followed by a `Take` that turns it into
+  typed `ParseWarning`s for that page and family; new poppler work needs
+  its own `Take`, or its messages land on the next family. Never install
+  another callback (`poppler::set_debug_error_function`, a
+  `GlobalParamsIniter` with a lambda): the core API readers call
+  `EnsurePopplerErrorCapture` instead.
 - **The content-addressed handshake** (`PdfDocument.sha256`) is served from
   an in-process LRU byte cache (`src/document_cache.h`), resolved once for
   all three RPCs in `ResolveDocumentBytes` (`src/poppler_service_impl.cpp`).

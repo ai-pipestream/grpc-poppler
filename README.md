@@ -96,6 +96,27 @@ Setting either to `0` disables caching; a document larger than the byte
 ceiling is never stored. SHA-256 comes from the boringssl `crypto` target
 the gRPC build already compiles; there is no new dependency.
 
+## Load verdicts
+
+A document that does not load is answered with a typed `LoadStatus`, which
+says what is wrong with the document and not what the request happened to
+carry. poppler-cpp tells only "not opened" from "opened but locked", so the
+verdict comes from poppler's core error code for the same bytes
+(`src/poppler_load.h`) and from what its security handler reported:
+
+| The document | `load_status` |
+|---|---|
+| is damaged past opening, or its catalog cannot be read | `CORRUPT`, with or without a password in the request |
+| is encrypted and no password was sent | `PASSWORD_REQUIRED` |
+| is encrypted and the password sent does not open it | `PASSWORD_INCORRECT` |
+| is encrypted by a security handler poppler does not have, or a Standard handler revision or dictionary it cannot use | `UNSUPPORTED_ENCRYPTION`, with or without a password: no password opens it |
+| fails for any other reason | `ENGINE_ERROR` |
+
+`load_detail` carries poppler's error code and its message. poppler itself
+opens a document whose Standard handler dictionary it cannot use as if it
+were not encrypted, and would hand out the encrypted strings and streams as
+they are; this service answers `UNSUPPORTED_ENCRYPTION` instead.
+
 ## Resource limits
 
 One request cannot make the service decode without bound. The defaults
@@ -123,6 +144,21 @@ the bytes it decodes to differ from its declared `/Params /Size` (poppler
 ends a stream it stops decoding part way as if at its end, so the mismatch
 is the one sign of that damage). If poppler's core API cannot open the document at all, no
 attachment is listed and a warning says so.
+
+What poppler itself reports reaches the caller the same way. poppler tells
+of a damaged content stream, a stream that does not decode or an xref
+table it had to rebuild only through its error callback, and hands back
+whatever it could still read, so `Parse` collects that callback for the
+request (`src/poppler_errors.h`) and puts each message in the trailer as a
+`ParseWarning` on the page and the family it was reading: no page and no
+family for what loading the document said, `PAGE_INVENTORY` and
+`TEXT_CELLS` with the `page_index` for a page, the family alone for the
+document-level ones. A page with such a warning may be missing text. The
+messages start with `poppler ` and its category (`syntax error`,
+`internal error`, ...); one that repeats is carried once with its count,
+and past 16 different messages for one piece of work the rest are counted,
+not listed. `Render` and `Probe` have no warning field in the contract
+yet, so what poppler says there goes to the service log.
 
 A set `PageRange` must have `end` greater than `begin`, the contract's one
 rule for it; anything else is `INVALID_ARGUMENT`. An `end` past the
